@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 import os
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
+WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
 
 
 def get_token():
@@ -12,7 +13,7 @@ def get_token():
     headers = {
         'Authorization': Walmart_Authorization,
         'Content-Type': 'application/x-www-form-urlencoded',
-        'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
@@ -54,7 +55,7 @@ def _fetch_orders_for_status(access_token: str, status: str, created_start: str,
             # Content-Type isn't needed for GET, but leaving it harmless is OK:
             # "Content-Type": "application/json",
             "WM_SEC.ACCESS_TOKEN": access_token,
-            "WM_QOS.CORRELATION_ID": str(uuid.uuid4()),  # must be unique-ish per request
+            "WM_QOS.CORRELATION_ID": WM_QOS_CORRELATION_ID,
             "WM_SVC.NAME": "My Walmart Inventory",
         }
 

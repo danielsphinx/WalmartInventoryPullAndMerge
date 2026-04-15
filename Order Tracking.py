@@ -6,6 +6,7 @@ from datetime import datetime
 import os
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
+WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
 
 def gettoken():
 
@@ -14,7 +15,7 @@ def gettoken():
     headers = {
         'Authorization': Walmart_Authorization,
         'Content-Type': 'application/x-www-form-urlencoded',
-        'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
@@ -75,7 +76,7 @@ def update_order_shipping(order_data):
         headers = {
             'Content-Type': 'application/json',
             'WM_SEC.ACCESS_TOKEN': access_token,
-            'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
             'WM_SVC.NAME': 'My Walmart Inventory'
         }
 

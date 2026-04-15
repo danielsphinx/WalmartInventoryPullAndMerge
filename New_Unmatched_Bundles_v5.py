@@ -1,9 +1,13 @@
 import requests
 import json
+import xml.etree.ElementTree as ET
 import pandas as pd
 import os
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
+WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
+if not Walmart_Authorization:
+    raise Exception("Walmart_Authorization environment variable is not set!")
 
 
 def get_token():
@@ -12,17 +16,26 @@ def get_token():
     headers = {
         'Authorization': Walmart_Authorization,
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',                   # <-- NEW: request JSON response
-        'WM_QOS.CORRELATION_ID': 'test',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
     response = requests.request("POST", url, headers=headers, data=payload)
+    print(f"Token Response Status: {response.status_code}")
     print(response.text)
 
-    # --- CHANGED: Parse JSON instead of XML ---
-    token_data = response.json()
-    access_token = token_data['access_token']
+    if response.status_code != 200:
+        raise Exception(f"Token request failed with status {response.status_code}: {response.text}")
+
+    # Try JSON first, fall back to XML (token endpoint may return either)
+    try:
+        token_data = response.json()
+        access_token = token_data['access_token']
+    except (requests.exceptions.JSONDecodeError, ValueError, KeyError):
+        root = ET.fromstring(response.text)
+        access_token_element = root.find(".//accessToken")
+        access_token = access_token_element.text
+
     return access_token
 
 
@@ -169,7 +182,7 @@ def process_batch(batch):
 
     headers = {
         'WM_SEC.ACCESS_TOKEN': access_token,
-        'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'Walmart Marketplace',
         'Content-Type': 'application/json',
         'Accept': 'application/json'           # <-- NEW: explicitly request JSON response
@@ -180,4 +193,4 @@ def process_batch(batch):
 
 
 # Call the main function with the CSV file path
-new_products_full_data(r'G:\Automation Google Drive\Wholesale UI CSVs\Merged Browser Uploads\Walmart\New Merged New For Walmart Unmatched.csv')
+new_products_full_data(r'\\Truenas\Offline Files Backed Up\Automation Google Drive\Wholesale UI CSVs\DUPS AND BUNDLES\AMS\Walmart Files\New - Copy.csv')

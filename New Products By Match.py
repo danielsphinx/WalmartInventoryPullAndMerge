@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 import os
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
+WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
 
 def gettoken():
     url = "https://marketplace.walmartapis.com/v3/token"
@@ -12,7 +13,7 @@ def gettoken():
     headers = {
         'Authorization': Walmart_Authorization,
         'Content-Type': 'application/x-www-form-urlencoded',
-        'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
@@ -28,7 +29,7 @@ def upload_new_products(access_token, new_product_uploads):
     url = "https://marketplace.walmartapis.com/v3/feeds?feedType=MP_ITEM_MATCH"
     headers = {
         'WM_SEC.ACCESS_TOKEN': access_token,
-        'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'Walmart Marketplace',
         'Content-Type': 'application/json'
     }

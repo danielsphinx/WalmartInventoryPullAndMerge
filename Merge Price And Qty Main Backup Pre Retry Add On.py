@@ -7,6 +7,7 @@ import time
 import os
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
+WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
 
 
 def gettoken():
@@ -16,7 +17,7 @@ def gettoken():
     headers = {
         'Authorization': Walmart_Authorization,
         'Content-Type': 'application/x-www-form-urlencoded',
-        'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
@@ -50,7 +51,7 @@ def getInventory():
 
         headers = {
             'WM_SEC.ACCESS_TOKEN': access_token,
-            'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
             'WM_SVC.NAME': 'YOUR_SERVICE_NAME',
             'Accept': 'application/json'
         }
@@ -138,7 +139,7 @@ def getPricing():
         payload = {}
         headers = {
             'WM_SEC.ACCESS_TOKEN': access_token,
-            'WM_QOS.CORRELATION_ID': 'f025d437-70d9-45fb-9c56-1a580c4fcdfb',
+        'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
             'WM_SVC.NAME': 'My Walmart Inventory'
         }
         # print("this is the searched url ", url)
