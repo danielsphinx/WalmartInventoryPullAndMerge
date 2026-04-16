@@ -71,6 +71,7 @@ def new_products_full_data(csv_file_path):
         process_batch(batch)
 
 
+
 def process_batch(batch):
     url = "https://marketplace.walmartapis.com/v3/feeds?feedType=MP_ITEM"
 
