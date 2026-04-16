@@ -3,11 +3,31 @@ import json
 import xml.etree.ElementTree as ET
 import pandas as pd
 import os
+import math
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
 WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
 if not Walmart_Authorization:
     raise Exception("Walmart_Authorization environment variable is not set!")
+
+
+def clean_nans(obj):
+    """Recursively remove NaN/None values from dicts/lists so JSON stays valid.
+    NaN in JSON is not valid and causes 'Invalid JSON payload' errors."""
+    if isinstance(obj, dict):
+        cleaned = {}
+        for k, v in obj.items():
+            cleaned_v = clean_nans(v)
+            if cleaned_v is not None:
+                cleaned[k] = cleaned_v
+        return cleaned
+    elif isinstance(obj, list):
+        return [clean_nans(v) for v in obj if clean_nans(v) is not None]
+    elif isinstance(obj, float) and (math.isnan(obj) or pd.isna(obj)):
+        return None
+    elif obj is pd.NA or obj is None:
+        return None
+    return obj
 
 
 def get_token():
@@ -41,8 +61,6 @@ def get_token():
 
 def new_products_full_data(csv_file_path):
     product_data = pd.read_csv(csv_file_path)
-    # --- CHANGED: No longer filtering by UpperCaseCategory since all items go to "Music" product type ---
-    # Keep the filter in case there are blank rows you want to skip
     product_data = product_data[product_data['sku'].notna() & (product_data['sku'] != "")].copy()
     print(product_data)
 
@@ -73,10 +91,6 @@ def process_batch(batch):
         physical_media_format = row['physicalMediaFormat']
         secondary_image_urls = row['productSecondaryImageURL']
 
-        # Product ID handling — same logic as before.
-        # Bundles (SKUs with '-B-') use "CUSTOM" as the productId VALUE
-        # (requires GTIN exemption approved in Seller Center).
-        # Non-bundles use the UPC/GTIN padded to 14 digits.
         product_id = 'CUSTOM' if '-B-' in sku else str(int(row['productId'])).rjust(14, '0')
         print(f"SKU: {sku}, ProductID: {product_id}")
 
@@ -113,20 +127,13 @@ def process_batch(batch):
             "price": price,
             "ShippingWeight": shipping_weight,
             "MustShipAlone": "No",
-            # --- NEW REQUIRED FIELD ---
-            # Set to the country where your product is manufactured/produced.
-            # Change "United States" if your items come from elsewhere.
             "country_of_origin_substantial_transformation": "United States"
         }
 
-        # Add msrp if present
         if pd.notna(msrp):
             orderable["msrp"] = msrp
 
         # --- Visible section ---
-        # In 5.0, the product type key is "Music" (not the old dynamic category name).
-        # productName and brand have moved here from Orderable.
-        # Several new fields are now REQUIRED.
         music_visible = {
             "productName": product_name,
             "brand": brand,
@@ -135,8 +142,6 @@ def process_batch(batch):
             "keyFeatures": key_features,
             "physicalMediaFormat": [physical_media_format],
             "performer": [brand],
-
-            # --- NEW REQUIRED FIELDS in 5.0 ---
             "isProp65WarningRequired": "No",
             "condition": "New",
             "has_written_warranty": "No",
@@ -147,15 +152,13 @@ def process_batch(batch):
             }
         }
 
-        # Add secondary images if present
         if secondary_image_urls:
             music_visible["productSecondaryImageURL"] = secondary_image_urls
 
-        # Assemble the full item
         product_json = {
             "Orderable": orderable,
             "Visible": {
-                "Music": music_visible        # <-- CHANGED: Always "Music", not dynamic category
+                "Music": music_visible
             }
         }
 
@@ -165,10 +168,6 @@ def process_batch(batch):
         print("No valid items to submit in this batch.")
         return
 
-    # --- CHANGED: New MPItemFeedHeader for spec 5.0 ---
-    # Removed: processMode, subset, sellingChannel, subCategory
-    # Added: businessUnit
-    # Changed: version to 5.0 spec string
     payload = {
         "MPItemFeedHeader": {
             "businessUnit": "WALMART_US",
@@ -178,14 +177,22 @@ def process_batch(batch):
         "MPItem": mp_items
     }
 
+    # Clean NaN values — NaN in JSON is not valid and causes "Invalid JSON payload"
+    payload = clean_nans(payload)
+
     payload_json = json.dumps(payload)
+
+    # Debug: print the full payload so we can see exactly what's being sent
+    print("\n=== FULL PAYLOAD ===")
+    print(json.dumps(payload, indent=2))
+    print("=== END PAYLOAD ===\n")
 
     headers = {
         'WM_SEC.ACCESS_TOKEN': access_token,
         'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'Walmart Marketplace',
         'Content-Type': 'application/json',
-        'Accept': 'application/json'           # <-- NEW: explicitly request JSON response
+        'Accept': 'application/json'
     }
 
     response = requests.post(url, headers=headers, data=payload_json)
