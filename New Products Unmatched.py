@@ -3,10 +3,31 @@ import json
 import xml.etree.ElementTree as ET
 import pandas as pd
 import os
+import math
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
 WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
+if not Walmart_Authorization:
+    raise Exception("Walmart_Authorization environment variable is not set!")
 
+
+def clean_nans(obj):
+    """Recursively remove NaN/None values from dicts/lists so JSON stays valid.
+    NaN in JSON is not valid and causes 'Invalid JSON payload' errors."""
+    if isinstance(obj, dict):
+        cleaned = {}
+        for k, v in obj.items():
+            cleaned_v = clean_nans(v)
+            if cleaned_v is not None:
+                cleaned[k] = cleaned_v
+        return cleaned
+    elif isinstance(obj, list):
+        return [clean_nans(v) for v in obj if clean_nans(v) is not None]
+    elif isinstance(obj, float) and (math.isnan(obj) or pd.isna(obj)):
+        return None
+    elif obj is pd.NA or obj is None:
+        return None
+    return obj
 
 
 def get_token():
@@ -20,32 +41,35 @@ def get_token():
     }
 
     response = requests.request("POST", url, headers=headers, data=payload)
-
+    print(f"Token Response Status: {response.status_code}")
     print(response.text)
 
-    root = ET.fromstring(response.text)
-    access_token_element = root.find(".//accessToken")
+    if response.status_code != 200:
+        raise Exception(f"Token request failed with status {response.status_code}: {response.text}")
 
-    access_token = access_token_element.text
+    # Try JSON first, fall back to XML (token endpoint may return either)
+    try:
+        token_data = response.json()
+        access_token = token_data['access_token']
+    except (requests.exceptions.JSONDecodeError, ValueError, KeyError):
+        root = ET.fromstring(response.text)
+        access_token_element = root.find(".//accessToken")
+        access_token = access_token_element.text
+
     return access_token
 
-def new_products_full_data(csv_file_path):
-    # Read the product data from the CSV file into a DataFrame
-    product_data = pd.read_csv(csv_file_path)
-    product_data = product_data[product_data['UpperCaseCategory'].notna() & (product_data['UpperCaseCategory'] != "")].copy()
 
+def new_products_full_data(csv_file_path):
+    product_data = pd.read_csv(csv_file_path)
+    product_data = product_data[product_data['sku'].notna() & (product_data['sku'] != "")].copy()
     print(product_data)
 
-    # Set the batch size
     batch_size = 1000
 
-    # Call the function to update product information in batches
     for i in range(0, len(product_data), batch_size):
-        # Get a batch of rows
         batch = product_data[i:i+batch_size]
-
-        # Call the function to process the current batch
         process_batch(batch)
+
 
 
 def process_batch(batch):
@@ -63,14 +87,13 @@ def process_batch(batch):
         price = row['price']
         msrp = row['msrp']
         quantity = row['quantity']
-        product_id = 'CUSTOM' if '-B-' in sku else str(int(row['productId'])).rjust(14, '0')
-        print(product_id)
         shipping_weight = row['ShippingWeight']
         brand = row['brand']
         physical_media_format = row['physicalMediaFormat']
-        lower_case_category = row['LowerCaseCategory']
-        upper_case_category = row['UpperCaseCategory']
         secondary_image_urls = row['productSecondaryImageURL']
+
+        product_id = 'CUSTOM' if '-B-' in sku else str(int(row['productId'])).rjust(14, '0')
+        print(f"SKU: {sku}, ProductID: {product_id}")
 
         # Extract key features
         key_features = [
@@ -82,79 +105,100 @@ def process_batch(batch):
             f"Format: {physical_media_format}",
             f"Artist: {brand}"
         ]
+        key_features = [f for f in key_features if pd.notna(f) and f]
+        print(key_features)
 
-        # Filter out any empty strings or NaN values from key features
-        key_features = [feature for feature in key_features if pd.notna(feature) and feature]
-        print(key_features)  # Debug print to check filtered key features
-
-        # Convert secondary_image_urls to a list of strings
+        # Convert secondary image URLs to list
         if pd.notna(secondary_image_urls):
             secondary_image_urls = [url.strip() for url in secondary_image_urls.split(';')]
         else:
             secondary_image_urls = None
 
+        # =====================================================================
+        # BUILD THE 5.0 PAYLOAD STRUCTURE
+        # =====================================================================
 
-        # Create the JSON structure for the current product
-        product_json = {
-            "Orderable": {
-                "sku": sku,
-                "productIdentifiers": {
-                    "productIdType": "GTIN",
-                    "productId": str(product_id)
-                },
-                "productName": product_name,
-                "brand": brand,
-                "price": price,
-                "ShippingWeight": shipping_weight,
-                "MustShipAlone": "No"
+        # --- Orderable section ---
+        orderable = {
+            "sku": sku,
+            "productIdentifiers": {
+                "productIdType": "GTIN",
+                "productId": product_id
             },
-            "Visible": {
-                upper_case_category: {
-                    "shortDescription": short_description,
-                    "mainImageUrl": main_image_url,
-                    "keyFeatures": key_features,
-                    "physicalMediaFormat": [physical_media_format],
-                    "performer": [brand]
-                }
+            "price": price,
+            "ShippingWeight": shipping_weight,
+            "MustShipAlone": "No",
+            "country_of_origin_substantial_transformation": "United States"
+        }
+
+        if pd.notna(msrp):
+            orderable["msrp"] = msrp
+
+        # --- Visible section ---
+        music_visible = {
+            "productName": product_name,
+            "brand": brand,
+            "shortDescription": short_description,
+            "mainImageUrl": main_image_url,
+            "keyFeatures": key_features,
+            "physicalMediaFormat": [physical_media_format],
+            "performer": [brand],
+            "isProp65WarningRequired": "No",
+            "condition": "New",
+            "has_written_warranty": "No",
+            "isCollectible": "No",
+            "netContent": {
+                "productNetContentMeasure": 1,
+                "productNetContentUnit": "Each"
             }
         }
 
-        # Conditionally include the productSecondaryImageURL field
         if secondary_image_urls:
-            product_json["Visible"][upper_case_category]["productSecondaryImageURL"] = secondary_image_urls
+            music_visible["productSecondaryImageURL"] = secondary_image_urls
 
-        # Append the product JSON to the list
+        product_json = {
+            "Orderable": orderable,
+            "Visible": {
+                "Music": music_visible
+            }
+        }
+
         mp_items.append(product_json)
 
-    # Construct the complete payload
+    if not mp_items:
+        print("No valid items to submit in this batch.")
+        return
+
     payload = {
         "MPItemFeedHeader": {
-            "processMode": "REPLACE",
-            "subset": "EXTERNAL",
+            "businessUnit": "WALMART_US",
             "locale": "en",
-            "sellingChannel": "marketplace",
-            "version": "4.8",
-            "subCategory": "music"
+            "version": "5.0.20260114-19_40_57-api"
         },
         "MPItem": mp_items
     }
 
+    # Clean NaN values — NaN in JSON is not valid and causes "Invalid JSON payload"
+    payload = clean_nans(payload)
+
     payload_json = json.dumps(payload)
 
-    # Send the POST request to update the product information
+    # Debug: print the full payload so we can see exactly what's being sent
+    print("\n=== FULL PAYLOAD ===")
+    print(json.dumps(payload, indent=2))
+    print("=== END PAYLOAD ===\n")
+
     headers = {
         'WM_SEC.ACCESS_TOKEN': access_token,
         'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
         'WM_SVC.NAME': 'Walmart Marketplace',
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
     }
 
     response = requests.post(url, headers=headers, data=payload_json)
-
-    #  print(payload_json)
     print("Update Response:", response.text)
 
 
 # Call the main function with the CSV file path
-#new_products_full_data(r'G:\Automation Google Drive\Wholesale UI CSVs\Merged Browser Uploads\Walmart\New Merged New For Walmart Unmatched.csv')
 #new_products_full_data(r'\\Truenas\Offline Files Backed Up\Automation Google Drive\Wholesale UI CSVs\DUPS AND BUNDLES\AMS\Walmart Files\New.csv')
