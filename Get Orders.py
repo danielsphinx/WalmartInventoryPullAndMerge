@@ -248,7 +248,7 @@ def map_to_second_format():
 
                 # Create a list for each order line with the new headers
                 row = [
-                    order_id, order_date, name, price, tax, "", shipping_method, "",
+                    order_id, order_date, name, price, tax, "", "", shipping_method,
                     product_name, quantity, sku, address1, address2, city, state, postal_code,
                     "", order_status, "", "", country
                 ]

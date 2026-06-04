@@ -1,14 +1,62 @@
-import csv
 import requests
 import xml.etree.ElementTree as ET
+import csv
+import json
+import pandas as pd
+import time
 import os
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
 WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
 
+# Path to the merged inventory output (used both as fallback source and final output destination)
+MERGED_OUTPUT_PATH = r'G:\Automation Google Drive\Marketplace Exported Inventory\Walmart Full Inventory Exports\API Python Generated Merged Exports\Merged Price And Quantity Walmart Export.csv'
+QTY_OUTPUT_PATH = r'G:\Automation Google Drive\Marketplace Exported Inventory\Walmart Full Inventory Exports\API Python Generated Merged Exports\Walmart Quantity Export.csv'
+PRICES_OUTPUT_PATH = r'G:\Automation Google Drive\Marketplace Exported Inventory\Walmart Full Inventory Exports\API Python Generated Merged Exports\Walmart Prices Export.csv'
 
-def get_token():
+# Fallback quantity assigned to SKUs that were in the previous file but missing from the new scrape.
+# This is intentional: a non-zero value forces Walmart's update process to touch these SKUs
+# instead of silently skipping them when they're absent from the new export.
+FALLBACK_QTY = 10
+
+
+def load_previous_inventory(path):
+    """
+    Load the previous merged inventory CSV and return a dict of {sku: quantity}.
+    Returns an empty dict if the file does not exist or cannot be read.
+    """
+    if not os.path.exists(path):
+        print(f"[WARNING] Previous inventory file not found at: {path}")
+        print("[WARNING] Continuing with only the current scrape. No fallback data will be used.")
+        return {}
+
+    try:
+        df = pd.read_csv(path, dtype=str)
+
+        # The merged file uses 'WalmartExportSku' and 'availToSellQty'
+        if 'WalmartExportSku' not in df.columns or 'availToSellQty' not in df.columns:
+            print(f"[WARNING] Previous inventory file is missing expected columns. Skipping fallback.")
+            return {}
+
+        prev = {}
+        for _, row in df.iterrows():
+            sku = str(row['WalmartExportSku']).strip()
+            qty = str(row['availToSellQty']).strip()
+            if sku:
+                prev[sku] = qty
+
+        print(f"[INFO] Loaded {len(prev)} SKUs from previous inventory file.")
+        return prev
+
+    except Exception as e:
+        print(f"[WARNING] Could not read previous inventory file: {e}")
+        print("[WARNING] Continuing with only the current scrape.")
+        return {}
+
+
+def gettoken():
     url = "https://marketplace.walmartapis.com/v3/token"
+
     payload = 'grant_type=client_credentials'
     headers = {
         'Authorization': Walmart_Authorization,
@@ -17,251 +65,228 @@ def get_token():
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
-    response = requests.post(url, headers=headers, data=payload)
-    if response.status_code == 200:
-        root = ET.fromstring(response.text)
-        access_token_element = root.find(".//accessToken")
-        return access_token_element.text if access_token_element is not None else None
-    else:
-        print("Error getting token:", response.text)
-        return None
+    response = requests.request("POST", url, headers=headers, data=payload)
 
-import uuid
-from datetime import datetime, timedelta, timezone
-import requests
+    root = ET.fromstring(response.text)
+    access_token_element = root.find(".//accessToken")
+    access_token = access_token_element.text
+    return access_token
 
-def _iso_z(dt: datetime) -> str:
-    # Walmart accepts ISO timestamps; using UTC "Z" avoids timezone surprises.
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _fetch_orders_for_status(access_token: str, status: str, created_start: str, created_end: str, limit: int):
-    base_url = "https://marketplace.walmartapis.com/v3/orders"
-
-    # First page query
-    next_cursor = (
-        f"?limit={limit}"
-        f"&status={status}"
-        f"&createdStartDate={created_start}"
-        f"&createdEndDate={created_end}"
-    )
-
-    orders = []
+def getInventory():
+    products_retrieved = 0
+    sku_quantity_data = []
+    merged_inventory_data = []
+    next_cursor = None
+    max_retries = 3
 
     while True:
-        url = f"{base_url}{next_cursor}"
+        url = "https://marketplace.walmartapis.com/v3/inventories?limit=50"
 
-        headers = {
-            "Accept": "application/json",
-            # Content-Type isn't needed for GET, but leaving it harmless is OK:
-            # "Content-Type": "application/json",
-            "WM_SEC.ACCESS_TOKEN": access_token,
-            "WM_QOS.CORRELATION_ID": WM_QOS_CORRELATION_ID,
-            "WM_SVC.NAME": "My Walmart Inventory",
-        }
+        if next_cursor is not None:
+            url += f"&nextCursor={next_cursor}"
 
-        response = requests.get(url, headers=headers, timeout=60)
-        if response.status_code != 200:
-            print(f"Error fetching orders (status={status}):", response.status_code, response.text)
-            break
+        retries = 0
+        success = False
 
-        response_data = response.json()
+        while retries < max_retries and not success:
+            access_token = gettoken()
 
-        batch = response_data.get("list", {}).get("elements", {}).get("order", []) or []
-        orders.extend(batch)
+            headers = {
+                'WM_SEC.ACCESS_TOKEN': access_token,
+                'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
+                'WM_SVC.NAME': 'YOUR_SERVICE_NAME',
+                'Accept': 'application/json'
+            }
 
-        meta = response_data.get("list", {}).get("meta", {}) or {}
-        nc = meta.get("nextCursor")
-        if nc:
-            # Walmart often returns nextCursor as a querystring (starting with '?')
-            next_cursor = nc if str(nc).startswith("?") else ("?" + str(nc))
+            response = requests.get(url, headers=headers)
+            inventory_info = response.json()
+
+            if 'error' in inventory_info:
+                retries += 1
+                print(f"Error fetching inventory (attempt {retries}/{max_retries}):", inventory_info)
+                time.sleep(10)
+            else:
+                success = True
+                products_retrieved += 50
+                print(f"{products_retrieved} products qty checked")
+
+        if not success:
+            print("Failed to fetch inventory data after maximum retries. Continuing to the next page if available.")
+            continue
+
+        if 'elements' not in inventory_info or 'inventories' not in inventory_info['elements']:
+            print("Unexpected response format:", inventory_info)
+            continue
+
+        merged_inventory_data.extend(inventory_info['elements']['inventories'])
+
+        if 'nextCursor' in inventory_info.get('meta', {}):
+            next_cursor = inventory_info['meta']['nextCursor']
         else:
             break
 
-    return orders
+    for inventory_item in merged_inventory_data:
+        sku = inventory_item.get('sku', "")
+        avail_to_sell_qty = 0
 
-def get_orders(days_back=14, limit=100):
-    access_token = get_token()
-    if not access_token:
-        print("Failed to get access token")
-        return []
+        if 'nodes' in inventory_item:
+            for node in inventory_item['nodes']:
+                avail_to_sell_qty = node['availToSellQty'].get('amount', 0) if 'availToSellQty' in node else 0
 
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days_back)
+        sku_quantity_data.append([sku, avail_to_sell_qty])
 
-    created_start = _iso_z(start_dt)
-    created_end = _iso_z(end_dt)
-
-    # “Unshipped” typically includes both:
-    # - Created (new/unacknowledged)
-    # - Acknowledged
-    statuses = ["Created", "Acknowledged"]
-
-    all_orders = []
-    seen_po = set()
-
-    for status in statuses:
-        batch = _fetch_orders_for_status(
-            access_token=access_token,
-            status=status,
-            created_start=created_start,
-            created_end=created_end,
-            limit=limit
-        )
-
-        # Deduplicate by purchaseOrderId
-        for o in batch:
-            po = o.get("purchaseOrderId")
-            if not po or po in seen_po:
-                continue
-            seen_po.add(po)
-            all_orders.append(o)
-
-    return all_orders
+    return sku_quantity_data
 
 
+def apply_fallback(sku_quantity_data, previous_inventory):
+    """
+    Compare the freshly scraped SKUs against the previous inventory file.
+    Any SKU that was in the previous file but is missing from the new scrape gets added
+    back with FALLBACK_QTY. This prevents incomplete scrapes from leaving old Walmart
+    inventory untouched.
 
-# ...
+    Nothing is ever marked in stock based solely on the previous file.
+    The fallback quantity (10) is a deliberate signal, not a real stock count.
+    """
+    scraped_skus = {str(row[0]).strip() for row in sku_quantity_data if row[0]}
+    scraped_count = len(scraped_skus)
 
-def get_json_header_csv():
-    # Open a CSV file for writing
-    with open(
-            r'G:\Automation Google Drive\Google Sheet Connected CSVs\Pending Order Exports\Walmart\Raw Walmart Orders With JSON Headers.csv',
-            'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = [
-            'purchaseOrderId', 'customerOrderId', 'customerEmailId', 'orderDate', 'phone',
-            'estimatedDeliveryDate', 'estimatedShipDate', 'methodCode', 'name', 'address1', 'address2',
-            'city', 'state', 'postalCode', 'country', 'lineNumber', 'productName', 'sku', 'condition',
-            'chargeType', 'chargeName', 'chargeAmount_currency', 'chargeAmount_amount', 'taxName',
-            'taxAmount_currency', 'taxAmount_amount', 'unitOfMeasurement', 'orderLineAmount',
-            'status', 'statusDate', 'fulfillmentOption', 'shipMethod', 'pickUpDateTime',
-            'shippingProgramType'
-        ]  # Add other field names as needed
+    fallback_rows = []
+    missing_skus = []
 
-        writer = csv.writer(csvfile)
-        writer.writerow(fieldnames)
+    for sku, qty in previous_inventory.items():
+        if sku not in scraped_skus:
+            missing_skus.append(sku)
+            fallback_rows.append([sku, FALLBACK_QTY])
 
-        # Iterate over each order
-        data = get_orders(days_back=14)
+    # Build final list: all scraped rows + fallback rows for missing SKUs
+    final_data = list(sku_quantity_data) + fallback_rows
 
-        for order in data:
-            purchase_order_id = order.get("purchaseOrderId", "")
-            customer_order_id = order.get("customerOrderId", "")
-            customer_email_id = order.get("customerEmailId", "")
-            order_date = order.get("orderDate", "")
-            phone = order.get("shippingInfo", {}).get("phone", "")
-            estimated_delivery_date = order.get("shippingInfo", {}).get("estimatedDeliveryDate", "")
-            estimated_ship_date = order.get("shippingInfo", {}).get("estimatedShipDate", "")
-            method_code = order.get("shippingInfo", {}).get("methodCode", "")
-            name = order.get("shippingInfo", {}).get("postalAddress", {}).get("name", "")
-            address1 = order.get("shippingInfo", {}).get("postalAddress", {}).get("address1", "")
-            address2 = order.get("shippingInfo", {}).get("postalAddress", {}).get("address2", "")
-            city = order.get("shippingInfo", {}).get("postalAddress", {}).get("city", "")
-            state = order.get("shippingInfo", {}).get("postalAddress", {}).get("state", "")
-            postal_code = order.get("shippingInfo", {}).get("postalAddress", {}).get("postalCode", "")
-            country = order.get("shippingInfo", {}).get("postalAddress", {}).get("country", "")
+    # Logging
+    print(f"\n{'='*60}")
+    print(f"[SCRAPE SUMMARY]")
+    print(f"  SKUs found in this scrape:          {scraped_count}")
+    print(f"  SKUs in previous inventory file:    {len(previous_inventory)}")
+    print(f"  SKUs missing from new scrape:       {len(missing_skus)}")
+    print(f"  Total SKUs in final output:         {len(final_data)}")
+    if missing_skus:
+        print(f"\n[FALLBACK SKUs] (added with qty={FALLBACK_QTY} because they were missing from this scrape):")
+        for s in sorted(missing_skus):
+            print(f"    {s}")
+    else:
+        print(f"\n[FALLBACK SKUs] None. All previous SKUs were found in this scrape.")
+    print(f"{'='*60}\n")
 
-            # Iterate over each order line
-            for order_line in order.get("orderLines", {}).get("orderLine", []):
-                line_number = order_line.get("lineNumber", "")
-                product_name = order_line.get("item", {}).get("productName", "")
-                sku = order_line.get("item", {}).get("sku", "")
-                condition = order_line.get("item", {}).get("condition", "")
-
-                # Handle charges and tax details
-                charges = order_line.get("charges", {}).get("charge", [])
-                charge_type = charges[0].get("chargeType", "") if charges else ""
-                charge_name = charges[0].get("chargeName", "") if charges else ""
-                charge_amount_currency = charges[0].get("chargeAmount", {}).get("currency", "") if charges else ""
-                charge_amount_amount = charges[0].get("chargeAmount", {}).get("amount", "") if charges else ""
-
-                tax = charges[0].get("tax", {}) if charges else {}
-                tax_name = tax.get("taxName", "") if tax else ""
-                tax_amount_currency = tax.get("taxAmount", {}).get("currency", "") if tax else ""
-                tax_amount_amount = tax.get("taxAmount", {}).get("amount", "") if tax else ""
-
-                unit_of_measurement = order_line.get("orderLineQuantity", {}).get("unitOfMeasurement", "")
-                order_line_amount = order_line.get("orderLineQuantity", {}).get("amount", "")
-                status = order_line.get("orderLineStatuses", {}).get("orderLineStatus", [{}])[0].get("status", "")
-                status_date = order_line.get("statusDate", "")
-                fulfillment_option = order_line.get("fulfillment", {}).get("fulfillmentOption", "")
-                ship_method = order_line.get("fulfillment", {}).get("shipMethod", "")
-                pick_up_date_time = order_line.get("fulfillment", {}).get("pickUpDateTime", "")
-                shipping_program_type = order_line.get("fulfillment", {}).get("shippingProgramType", "")
-
-                # Create a list for each order line
-                row = [
-                    purchase_order_id, customer_order_id, customer_email_id, order_date, phone,
-                    estimated_delivery_date, estimated_ship_date, method_code, name, address1, address2,
-                    city, state, postal_code, country, line_number, product_name, sku, condition,
-                    charge_type, charge_name, charge_amount_currency, charge_amount_amount, tax_name,
-                    tax_amount_currency, tax_amount_amount, unit_of_measurement, order_line_amount,
-                    status, status_date, fulfillment_option, ship_method, pick_up_date_time,
-                    shipping_program_type
-                ]
-
-                # Write the row to the CSV file
-                writer.writerow(row)
-
-    print(
-        r'G:\Automation Google Drive\Google Sheet Connected CSVs\Pending Order Exports\Walmart\Raw Walmart Orders With JSON Headers.csv csv created')
+    return final_data
 
 
-# ...
+def getPricing():
+    sku_amount_data = []
+    merged_root = ET.Element('ItemResponses', {'xmlns:wmSpecs': 'http://walmart.com'})
+    merged_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><ItemResponses xmlns:wmSpecs="http://walmart.com" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:ns2="http://walmart.com"/>'
 
-def map_to_second_format():
-    # Open a CSV file for writing
-    with open(r'G:\Automation Google Drive\Google Sheet Connected CSVs\Pending Order Exports\Walmart\Walmart Orders With Order Bot Headers.csv', 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = [
-            'Order ID', 'Date', 'Buyer', 'Price', 'Tax', 'Tax Remitted', 'Shipping', 'Shipping Type',
-            'Products', 'Quantity', 'Retail ID', 'Street 1', 'Street 2', 'City', 'State', 'ZIP Code',
-            'Merchant Order Reference', 'Order Status', 'Invoice origin', 'Receiver ID', 'Country'
-        ]  # Add other field names as needed
+    next_cursor = '*'
 
-        writer = csv.writer(csvfile)
-        writer.writerow(fieldnames)
+    while True:
+        url = f"https://marketplace.walmartapis.com/v3/items?limit=200&nextCursor={next_cursor}"
 
-        # Iterate over each order
-        data = get_orders()  # Fetch orders
-        for order in data:
-            order_id = order.get("purchaseOrderId", "")
-            order_date = order.get("orderDate", "")
-            name = order.get("shippingInfo", {}).get("postalAddress", {}).get("name", "")
+        access_token = gettoken()
 
-            # Process each order line
-            for order_line in order.get("orderLines", {}).get("orderLine", []):
-                charges = order_line.get("charges", {}).get("charge", [])
-                price = order_line.get("charges", {}).get("charge", [{}])[0].get("chargeAmount", {}).get("amount", "")
-                tax = charges[0].get("tax", {}) if charges else {}
-                tax = tax.get("taxAmount", {}).get("amount", "") if tax else ""
-                shipping_method = order.get("shippingInfo", {}).get("methodCode", "")
-                product_name = order_line.get("item", {}).get("productName", "")
-                quantity = order_line.get("orderLineQuantity", {}).get("amount", "")
-                sku = order_line.get("item", {}).get("sku", "")
-                address1 = order.get("shippingInfo", {}).get("postalAddress", {}).get("address1", "")
-                address2 = order.get("shippingInfo", {}).get("postalAddress", {}).get("address2", "")
-                city = order.get("shippingInfo", {}).get("postalAddress", {}).get("city", "")
-                state = order.get("shippingInfo", {}).get("postalAddress", {}).get("state", "")
-                postal_code = order.get("shippingInfo", {}).get("postalAddress", {}).get("postalCode", "")
-                order_statuses = order_line.get("orderLineStatuses", {}).get("orderLineStatus", [{}])
-                order_status = order_statuses[0].get("status", "") if order_statuses else ""
-                country = order.get("shippingInfo", {}).get("postalAddress", {}).get("country", "")
+        payload = {}
+        headers = {
+            'WM_SEC.ACCESS_TOKEN': access_token,
+            'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID,
+            'WM_SVC.NAME': 'My Walmart Inventory'
+        }
 
-                # Create a list for each order line with the new headers
-                row = [
-                    order_id, order_date, name, price, tax, "", shipping_method, "",
-                    product_name, quantity, sku, address1, address2, city, state, postal_code,
-                    "", order_status, "", "", country
-                ]
+        r = requests.get(url, headers=headers)
 
-                # Write the row to the CSV file
-                writer.writerow(row)
+        root = ET.fromstring(r.content)
 
-    print(r'G:\Automation Google Drive\Google Sheet Connected CSVs\Pending Order Exports\Walmart\Walmart Orders With Order Bot Headers.csv csv created')
-"G:\Documents And Logs"
-# Clear the lists before processing new orders
-all_item_info = []
-all_order_bot_item_info = []
+        merged_root.append(root)
+        print("pause between pricing 200")
 
-# Process orders and write to CSV
-get_json_header_csv()
-map_to_second_format()
+        next_cursor_element = root.find('nextCursor')
+        if next_cursor_element is not None:
+            next_cursor = next_cursor_element.text
+        else:
+            break
+
+    root = merged_root
+
+    for element in root.iter():
+        if element.tag.endswith('sku'):
+            sku = element.text
+        if element.tag.endswith('amount'):
+            amount = element.text
+            if sku and amount:
+                sku_amount_data.append([sku, amount])
+
+    return sku_amount_data
+
+
+def writeCSVinventory(sku_quantity_data):
+    with open(QTY_OUTPUT_PATH, 'w', newline='') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        header = ["sku", "availToSellQty"]
+        csv_writer.writerow(header)
+        csv_writer.writerows(sku_quantity_data)
+
+    print("Inventory data (sku and availToSellQty) has been written to", QTY_OUTPUT_PATH)
+
+
+def writeCSVprice(sku_amount_data):
+    with open(PRICES_OUTPUT_PATH, 'w', newline='') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["SKU", "Amount"])
+        csv_writer.writerows(sku_amount_data)
+
+    print("CSV file has been created:", PRICES_OUTPUT_PATH)
+
+
+def writeCSVmerged():
+    print("Loading Prices CSV...")
+    df_prices = pd.read_csv(PRICES_OUTPUT_PATH, encoding='utf-8', dtype=str)
+
+    print("Loading Qty CSV...")
+    df_qty = pd.read_csv(QTY_OUTPUT_PATH, encoding='utf-8', dtype=str)
+
+    print("Merging DataFrames...")
+    merged_df = pd.merge(df_qty, df_prices, left_on='sku', right_on='SKU', how='left')
+
+    print("Renaming columns...")
+    merged_df.rename(columns={'sku': 'WalmartExportSku'}, inplace=True)
+
+    print("Filling blank values in 'Amount' column with 0...")
+    merged_df['Amount'] = merged_df['Amount'].fillna('0')
+
+    print("Dropping 'SKU' column...")
+    merged_df.drop(columns=['SKU'], inplace=True)
+
+    print("Saving the merged DataFrame to CSV...")
+    merged_df.to_csv(MERGED_OUTPUT_PATH, encoding='utf-8', index=False)
+
+    print(f"Merge complete. The merged dataset has been saved to: {MERGED_OUTPUT_PATH}")
+
+
+# ── Main flow ──────────────────────────────────────────────────────────────────
+
+# Step 1: Load the previous inventory file BEFORE touching anything else.
+# This snapshot is used as the fallback source if the new scrape misses SKUs.
+previous_inventory = load_previous_inventory(MERGED_OUTPUT_PATH)
+
+# Step 2: Run the new scrape as usual.
+sku_quantity_data = getInventory()
+sku_amount_data = getPricing()
+
+# Step 3: Apply fallback logic.
+# SKUs confirmed in the new scrape keep their real quantity.
+# SKUs that were in the previous file but are missing from this scrape get FALLBACK_QTY.
+# Nothing is ever marked in stock based only on incomplete scrape data.
+sku_quantity_data = apply_fallback(sku_quantity_data, previous_inventory)
+
+# Step 4: Write outputs (same format as before).
+writeCSVinventory(sku_quantity_data)
+writeCSVprice(sku_amount_data)
+writeCSVmerged()
