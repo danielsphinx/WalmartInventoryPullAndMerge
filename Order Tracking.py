@@ -22,7 +22,7 @@ def gettoken():
     response = requests.post(url, headers=headers, data=payload)
     if response.status_code == 200:
         root = ET.fromstring(response.text)
-        access_token_element = root.find(".//accessToken")
+        access_token_element = next((el for el in root.iter() if el.tag.rsplit("}", 1)[-1].replace("_", "").lower() == "accesstoken"), None)  # feed-http
         return access_token_element.text if access_token_element is not None else None
     else:
         print("Error getting token:", response.text)
