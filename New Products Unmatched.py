@@ -4,6 +4,15 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import os
 import math
+import importlib.util  # never-relist-gate
+_gate_spec = importlib.util.spec_from_file_location("walmart_retired_filter", r"G:\Python Projects\WalmartInventoryPullAndMerge\walmart_retired_filter.py")  # never-relist-gate
+_gate = importlib.util.module_from_spec(_gate_spec)  # never-relist-gate
+_gate_spec.loader.exec_module(_gate)  # never-relist-gate
+load_retired_skus, drop_retired_rows, drop_retired_skus = _gate.load_retired_skus, _gate.drop_retired_rows, _gate.drop_retired_skus  # never-relist-gate
+_http_spec = importlib.util.spec_from_file_location("walmart_feed_http", r"G:\Python Projects\WalmartInventoryPullAndMerge\walmart_feed_http.py")  # feed-http
+_http = importlib.util.module_from_spec(_http_spec)  # feed-http
+_http_spec.loader.exec_module(_http)  # feed-http
+walmart_post = _http.post  # feed-http
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
 WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
@@ -40,28 +49,21 @@ def get_token():
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
-    response = requests.request("POST", url, headers=headers, data=payload)
+    response = walmart_post(url, kind="token", headers=headers, data=payload)  # feed-http
     print(f"Token Response Status: {response.status_code}")
     print(response.text)
 
-    if response.status_code != 200:
-        raise Exception(f"Token request failed with status {response.status_code}: {response.text}")
-
-    # Try JSON first, fall back to XML (token endpoint may return either)
-    try:
-        token_data = response.json()
-        access_token = token_data['access_token']
-    except (requests.exceptions.JSONDecodeError, ValueError, KeyError):
-        root = ET.fromstring(response.text)
-        access_token_element = root.find(".//accessToken")
-        access_token = access_token_element.text
-
-    return access_token
+    return _http.token_from(response)  # feed-http
 
 
+@_http.logged("New Products Unmatched")  # feed-http
 def new_products_full_data(csv_file_path):
     product_data = pd.read_csv(csv_file_path)
     product_data = product_data[product_data['sku'].notna() & (product_data['sku'] != "")].copy()
+    _retired = load_retired_skus()  # never-relist-gate
+    product_data = drop_retired_rows(product_data, 'sku', 'MP_ITEM New Products Unmatched', _retired)  # never-relist-gate
+    # Never relist gate, GTIN: drop a row whose GTIN is retired even when its SKU is new. The GTIN sent is productId; a '-B-' bundle is sent as CUSTOM, no GTIN.
+    product_data = _gate.drop_retired_gtin_rows(product_data, [None if '-B-' in str(s) else g for s, g in zip(product_data['sku'], product_data['productId'])], 'MP_ITEM New Products Unmatched', _retired)  # never-relist-gate
     print(product_data)
 
     batch_size = 1000
@@ -196,7 +198,7 @@ def process_batch(batch):
         'Accept': 'application/json'
     }
 
-    response = requests.post(url, headers=headers, data=payload_json)
+    response = walmart_post(url, kind="feed", headers=headers, data=payload_json)  # feed-http
     print("Update Response:", response.text)
 
 

@@ -14,3 +14,6 @@ venv/
 .DS_Store
 Thumbs.db
 output.txt
+
+# Plans of action for Walmart hold the account narrative; they live in the private compliance repo (walmart-full-checks-and-upgrades, docs/ and handoff/), not in this public one
+Walmart POA */

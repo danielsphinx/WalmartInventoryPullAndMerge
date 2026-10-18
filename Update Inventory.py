@@ -3,6 +3,15 @@ import json
 import pandas as pd
 import xml.etree.ElementTree as ET
 import os
+import importlib.util  # never-relist-gate
+_gate_spec = importlib.util.spec_from_file_location("walmart_retired_filter", r"G:\Python Projects\WalmartInventoryPullAndMerge\walmart_retired_filter.py")  # never-relist-gate
+_gate = importlib.util.module_from_spec(_gate_spec)  # never-relist-gate
+_gate_spec.loader.exec_module(_gate)  # never-relist-gate
+load_retired_skus, drop_retired_rows, drop_retired_skus = _gate.load_retired_skus, _gate.drop_retired_rows, _gate.drop_retired_skus  # never-relist-gate
+_http_spec = importlib.util.spec_from_file_location("walmart_feed_http", r"G:\Python Projects\WalmartInventoryPullAndMerge\walmart_feed_http.py")  # feed-http
+_http = importlib.util.module_from_spec(_http_spec)  # feed-http
+_http_spec.loader.exec_module(_http)  # feed-http
+walmart_post = _http.post  # feed-http
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
 WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
@@ -20,15 +29,11 @@ def gettoken():
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
-    response = requests.request("POST", url, headers=headers, data=payload)
+    response = walmart_post(url, kind="token", headers=headers, data=payload)  # feed-http
 
     print(response.text)
 
-    root = ET.fromstring(response.text)
-    access_token_element = root.find(".//accessToken")
-
-    access_token = access_token_element.text
-    return access_token
+    return _http.token_from(response)  # feed-http
 
 
 def update_inventory_batch(access_token, inventory_updates):
@@ -49,15 +54,19 @@ def update_inventory_batch(access_token, inventory_updates):
 
     payload_json = json.dumps(payload)
 
-    response = requests.post(url, headers=headers, data=payload_json)
+    response = walmart_post(url, kind="feed", headers=headers, data=payload_json)  # feed-http
 
     print(response.text)
 
+@_http.logged("Update Inventory")  # feed-http
 def makescriptnamed(walmartupdatecsvpath):
+    # Never relist gate first: a refusal must happen before any request leaves this process.
+    _retired = load_retired_skus()  # never-relist-gate
     access_token = gettoken()
 
     # Read the entire inventory data from the CSV file
     inventory_data = pd.read_csv(walmartupdatecsvpath, encoding='utf-8-sig', low_memory=False, dtype={'ColumnName': str})
+    inventory_data = drop_retired_rows(inventory_data, 'sku', 'inventory Update Inventory', _retired)  # never-relist-gate
 
     # Set the batch size (e.g., 1000)
     batch_size = 10000

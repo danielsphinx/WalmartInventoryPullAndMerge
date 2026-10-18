@@ -15,6 +15,11 @@ import pandas as pd
 import requests
 from requests import Response, Session
 from requests.exceptions import RequestException, Timeout
+# Never relist gate: the gate module beside this file, loaded by its path, holds the one rule.
+import importlib.util  # never-relist-gate
+_gate_spec = importlib.util.spec_from_file_location("walmart_retired_filter", r"G:\Python Projects\WalmartInventoryPullAndMerge\walmart_retired_filter.py")  # never-relist-gate
+_gate = importlib.util.module_from_spec(_gate_spec)  # never-relist-gate
+_gate_spec.loader.exec_module(_gate)  # never-relist-gate
 
 
 TOKEN_URL = "https://marketplace.walmartapis.com/v3/token"
@@ -31,6 +36,11 @@ QTY_OUTPUT_PATH = OUTPUT_DIR / "Walmart Quantity Export.csv"
 PRICES_OUTPUT_PATH = OUTPUT_DIR / "Walmart Prices Export.csv"
 INVENTORY_REPORT_REQUEST_ID_PATH = OUTPUT_DIR / "Walmart Inventory Report Request ID.txt"
 ITEM_REPORT_REQUEST_ID_PATH = OUTPUT_DIR / "Walmart Item Report Request ID.txt"
+RETIRED_SKUS_DIR = Path(os.getenv(
+    "WALMART_RETIRED_SKUS_DIR",
+    r"C:\Users\Daniel\Downloads\AI\GPT Projects\Walmart Account Quality\walmart-full-checks-and-upgrades\handoff",
+))
+RETIRED_SKU_FILES = ("retire_approved.csv", "retire_flagged_offensive_approved.csv")
 
 # Intentional safety net: if a SKU existed in the previous merged output but is
 # missing from this run, include it with this signal quantity so Walmart updates it.
@@ -120,15 +130,25 @@ class WalmartClient:
             INVENTORY_REPORT_REQUEST_ID_PATH,
             "WALMART_INVENTORY_REPORT_REQUEST_ID",
         )
+        report: dict[str, Any] | None = None
+        request_id: str | None = None
         if cached_request_id:
             print(f"Resuming inventory report request: {cached_request_id}")
             cached_rows = self.try_download_cached_report(cached_request_id, parse_inventory_report)
             if cached_rows is not None:
                 return cached_rows
 
-            report = self.wait_for_report(cached_request_id, "inventory")
-            request_id = cached_request_id
-        else:
+            try:
+                report = self.wait_for_report(cached_request_id, "inventory")
+                request_id = cached_request_id
+            except RuntimeError as exc:
+                print(
+                    f"[WARNING] Cached inventory report request {cached_request_id} is no longer "
+                    f"usable; discarding it and requesting a fresh report: {exc}"
+                )
+                clear_cached_report_request_id(INVENTORY_REPORT_REQUEST_ID_PATH)
+
+        if report is None or request_id is None:
             report, request_id = self.request_report(
                 report_type="INVENTORY",
                 report_version="v1",
@@ -375,15 +395,25 @@ class WalmartClient:
             ITEM_REPORT_REQUEST_ID_PATH,
             "WALMART_ITEM_REPORT_REQUEST_ID",
         )
+        report: dict[str, Any] | None = None
+        request_id: str | None = None
         if cached_request_id:
             print(f"Resuming item report request: {cached_request_id}")
             cached_rows = self.try_download_cached_report(cached_request_id, parse_item_price_report)
             if cached_rows is not None:
                 return cached_rows
 
-            report = self.wait_for_report(cached_request_id, "item")
-            request_id = cached_request_id
-        else:
+            try:
+                report = self.wait_for_report(cached_request_id, "item")
+                request_id = cached_request_id
+            except RuntimeError as exc:
+                print(
+                    f"[WARNING] Cached item report request {cached_request_id} is no longer "
+                    f"usable; discarding it and requesting a fresh report: {exc}"
+                )
+                clear_cached_report_request_id(ITEM_REPORT_REQUEST_ID_PATH)
+
+        if report is None or request_id is None:
             report, request_id = self.request_report(
                 report_type="ITEM",
                 report_version="v4",
@@ -584,6 +614,26 @@ def load_cached_report_request_id(path: Path, env_var_name: str) -> str | None:
 def save_cached_report_request_id(path: Path, request_id: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(request_id, encoding="utf-8")
+
+
+def clear_cached_report_request_id(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[WARNING] Could not delete stale report request cache {path}: {exc}")
+
+
+# The gate's own loader: both lists required, a refusal of a missing or defective list, the
+# dated waiver only (ALLOW_UNFILTERED_EXPORT=1 with ALLOW_UNFILTERED_EXPORT_UNTIL), the freshness check.
+load_retired_skus = _gate.load_retired_skus  # never-relist-gate
+
+
+def drop_retired(rows: list[list[Any]], retired: set[str], label: str) -> list[list[Any]]:
+    kept = [row for row, keep in zip(rows, _gate.keep_mask([row[0] for row in rows], retired)) if keep]  # never-relist-gate
+    dropped = len(rows) - len(kept)
+    if dropped:
+        print(f"[INFO] Excluded {dropped} retired SKU(s) from the {label} data.")
+    return kept
 
 
 def normalize_price(value: Any) -> str:
@@ -871,10 +921,20 @@ def main() -> None:
     config = WalmartConfig.from_environment()
     client = WalmartClient(config)
 
+    retired_skus = load_retired_skus()
     previous_inventory = load_previous_inventory(MERGED_OUTPUT_PATH)
+    retired_in_previous = _gate.keep_mask(list(previous_inventory), retired_skus).count(False)  # never-relist-gate
+    if retired_in_previous:
+        print(f"[INFO] Excluded {retired_in_previous} retired SKU(s) from the previous "
+              "inventory baseline (retired SKUs never receive the fallback quantity).")
+        previous_inventory = {
+            sku: qty for (sku, qty), keep in zip(previous_inventory.items(), _gate.keep_mask(list(previous_inventory), retired_skus)) if keep  # never-relist-gate
+        }
     sku_quantity_data = client.fetch_inventory()
+    sku_quantity_data = drop_retired(sku_quantity_data, retired_skus, "inventory")
     validate_inventory_completeness(sku_quantity_data, previous_inventory)
     sku_amount_data = client.fetch_prices()
+    sku_amount_data = drop_retired(sku_amount_data, retired_skus, "price")
     sku_quantity_data = apply_fallback(sku_quantity_data, previous_inventory)
 
     write_inventory_csv(sku_quantity_data)

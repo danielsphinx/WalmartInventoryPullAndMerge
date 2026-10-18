@@ -3,6 +3,15 @@ import json
 import pandas as pd
 import xml.etree.ElementTree as ET
 import os
+import importlib.util  # never-relist-gate
+_gate_spec = importlib.util.spec_from_file_location("walmart_retired_filter", r"G:\Python Projects\WalmartInventoryPullAndMerge\walmart_retired_filter.py")  # never-relist-gate
+_gate = importlib.util.module_from_spec(_gate_spec)  # never-relist-gate
+_gate_spec.loader.exec_module(_gate)  # never-relist-gate
+load_retired_skus, drop_retired_rows, drop_retired_skus = _gate.load_retired_skus, _gate.drop_retired_rows, _gate.drop_retired_skus  # never-relist-gate
+_http_spec = importlib.util.spec_from_file_location("walmart_feed_http", r"G:\Python Projects\WalmartInventoryPullAndMerge\walmart_feed_http.py")  # feed-http
+_http = importlib.util.module_from_spec(_http_spec)  # feed-http
+_http_spec.loader.exec_module(_http)  # feed-http
+walmart_post = _http.post  # feed-http
 
 Walmart_Authorization = os.getenv('Walmart_Authorization')
 WM_QOS_CORRELATION_ID = os.getenv('WM_QOS_CORRELATION_ID')
@@ -19,15 +28,14 @@ def get_token():
         'WM_SVC.NAME': 'My Walmart Inventory'
     }
 
-    response = requests.request("POST", url, headers=headers, data=payload)
+    response = walmart_post(url, kind="token", headers=headers, data=payload)  # feed-http
 
-    root = ET.fromstring(response.text)
-    access_token_element = root.find(".//accessToken")
+    return _http.token_from(response)  # feed-http
 
-    access_token = access_token_element.text
-    return access_token
-
+@_http.logged("Update Pricing")  # feed-http
 def make_script_named(walmart_update_csv_path):
+    # Never relist gate first: a refusal must happen before any request leaves this process.
+    _retired = load_retired_skus()  # never-relist-gate
     access_token = get_token()
 
     url = "https://marketplace.walmartapis.com/v3/feeds?feedType=price"
@@ -39,6 +47,7 @@ def make_script_named(walmart_update_csv_path):
     }
 
     inventory_data = pd.read_csv(walmart_update_csv_path, encoding='utf-8-sig')
+    inventory_data = drop_retired_rows(inventory_data, 'sku', 'price Update Pricing', _retired)  # never-relist-gate
 
     # Set the batch size
     batch_size = 10000
@@ -81,7 +90,7 @@ def process_batch_prices(batch, url, headers):
 
     payload_json = json.dumps(payload)
 
-    response = requests.post(url, headers=headers, data=payload_json)
+    response = walmart_post(url, kind="feed", headers=headers, data=payload_json)  # feed-http
 
     print("Update Response:", response.text)
 
