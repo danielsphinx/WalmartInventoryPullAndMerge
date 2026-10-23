@@ -114,9 +114,15 @@ class WalmartClient:
         except ET.ParseError as exc:
             raise RuntimeError(f"Token response was not valid XML: {exc}") from exc
 
-        access_token = find_text(root, "accessToken")
+        # Walmart has spelled the element accessToken and access_token (the snake case shape
+        # <oAuthTokenDTO><access_token> was seen 2026-10-15); accept any spelling.
+        access_token = next(
+            (clean_text(element.text) for element in root.iter()
+             if local_name(element.tag).replace("_", "").lower() == "accesstoken"),
+            None,
+        )
         if not access_token:
-            raise RuntimeError("Token response did not include accessToken.")
+            raise RuntimeError("Token response did not include accessToken (any spelling).")
         return access_token
 
     def fetch_inventory(self) -> list[list[Any]]:
