@@ -7,6 +7,7 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -55,6 +56,13 @@ MIN_INVENTORY_COMPLETENESS_RATIO = 0.90
 REPORT_POLL_SECONDS = 300
 REPORT_RATE_LIMIT_SLEEP_SECONDS = 300
 REPORT_TIMEOUT_SECONDS = 7200
+# A cached report request ID is reused only while it is this young. An older one means the data
+# behind it is stale: a fresh report is requested first and the cached one is only a fallback.
+REPORT_CACHE_MAX_AGE_HOURS = 1.0
+REPORT_CACHE_MAX_AGE_ENV_VAR = "WALMART_REPORT_CACHE_MAX_AGE_HOURS"
+# While a stale cached report can stand in, a rate-limited report creation is retried this many
+# times (REPORT_RATE_LIMIT_SLEEP_SECONDS apart) before the stale report is used instead.
+REPORT_RATE_LIMIT_MAX_RETRIES_WITH_FALLBACK = 3
 
 
 class NonRetryableWalmartError(RuntimeError):
@@ -65,6 +73,22 @@ class NonRetryableWalmartError(RuntimeError):
 
 class RateLimitedWalmartError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class CachedReportRequest:
+    request_id: str
+    requested_at: datetime | None  # None when the ID came from an environment variable
+
+    def age(self) -> timedelta | None:
+        if self.requested_at is None:
+            return None
+        return datetime.now().astimezone() - self.requested_at
+
+    def describe(self) -> str:
+        if self.requested_at is None:
+            return "report request time unknown"
+        return f"report requested {self.requested_at:%Y-%m-%d %H:%M} ({format_age(self.age())} old)"
 
 
 @dataclass(frozen=True)
@@ -132,46 +156,107 @@ class WalmartClient:
         return self.fetch_inventory_from_report()
 
     def fetch_inventory_from_report(self) -> list[list[Any]]:
-        cached_request_id = load_cached_report_request_id(
-            INVENTORY_REPORT_REQUEST_ID_PATH,
-            "WALMART_INVENTORY_REPORT_REQUEST_ID",
+        return self.fetch_report_rows(
+            report_type="INVENTORY",
+            report_version="v1",
+            cache_path=INVENTORY_REPORT_REQUEST_ID_PATH,
+            env_var_name="WALMART_INVENTORY_REPORT_REQUEST_ID",
+            label="inventory",
+            parser=parse_inventory_report,
+            unit="SKUs",
         )
-        report: dict[str, Any] | None = None
-        request_id: str | None = None
-        if cached_request_id:
-            print(f"Resuming inventory report request: {cached_request_id}")
-            cached_rows = self.try_download_cached_report(cached_request_id, parse_inventory_report)
-            if cached_rows is not None:
-                return cached_rows
 
-            try:
-                report = self.wait_for_report(cached_request_id, "inventory")
-                request_id = cached_request_id
-            except RuntimeError as exc:
+    def fetch_report_rows(
+        self,
+        report_type: str,
+        report_version: str,
+        cache_path: Path,
+        env_var_name: str,
+        label: str,
+        parser,
+        unit: str,
+    ) -> list[list[Any]]:
+        """Fetch one report. A cached request ID is for resuming, not for republishing old data:
+        an ID younger than REPORT_CACHE_MAX_AGE_HOURS is downloaded (or waited for when the report
+        is still generating); an older one means the data is stale, so a fresh report is requested
+        first and the cached one stands in only when the fresh request is rate limited or fails."""
+        cached = load_cached_report_request(cache_path, env_var_name)
+        max_age = report_cache_max_age()
+        stale: CachedReportRequest | None = None
+
+        if cached is not None:
+            age = cached.age()
+            if age is None or age <= max_age:
+                print(f"Resuming {label} report request: {cached.request_id} ({cached.describe()})")
+                rows = self.try_download_cached_report(cached.request_id, parser)
+                if rows is not None:
+                    print(f"Cached {label} report parsed: {len(rows)} {unit}, {cached.describe()}.")
+                    return rows
+
+                try:
+                    report = self.wait_for_report(cached.request_id, label)
+                    return self.download_ready_report(report, cached, cache_path, label, parser, unit)
+                except RuntimeError as exc:
+                    print(
+                        f"[WARNING] Cached {label} report request {cached.request_id} is no longer "
+                        f"usable; discarding it and requesting a fresh report: {exc}"
+                    )
+                    clear_cached_report_request_id(cache_path)
+            else:
                 print(
-                    f"[WARNING] Cached inventory report request {cached_request_id} is no longer "
-                    f"usable; discarding it and requesting a fresh report: {exc}"
+                    f"[INFO] Cached {label} report request {cached.request_id} is older than the "
+                    f"{max_age.total_seconds() / 3600:g} h limit ({cached.describe()}; {REPORT_CACHE_MAX_AGE_ENV_VAR} "
+                    "sets the limit); requesting a fresh report and keeping the cached one as a fallback."
                 )
-                clear_cached_report_request_id(INVENTORY_REPORT_REQUEST_ID_PATH)
+                stale = cached
 
-        if report is None or request_id is None:
-            report, request_id = self.request_report(
-                report_type="INVENTORY",
-                report_version="v1",
-                cache_path=INVENTORY_REPORT_REQUEST_ID_PATH,
-                label="inventory",
+        try:
+            report, fresh = self.request_report(
+                report_type=report_type,
+                report_version=report_version,
+                cache_path=cache_path,
+                label=label,
+                max_rate_limit_retries=REPORT_RATE_LIMIT_MAX_RETRIES_WITH_FALLBACK if stale else None,
             )
+            return self.download_ready_report(report, fresh, cache_path, label, parser, unit)
+        except (RuntimeError, RequestException) as exc:
+            if stale is None:
+                raise
+            print(
+                f"[WARNING] Fresh {label} report failed ({exc}); falling back to the STALE cached "
+                f"report {stale.request_id} ({stale.describe()})."
+            )
+            rows = self.try_download_cached_report(stale.request_id, parser)
+            if rows is None:
+                raise RuntimeError(
+                    f"Fresh {label} report failed and the stale cached report {stale.request_id} "
+                    f"({stale.describe()}) could not be downloaded either."
+                ) from exc
+            print(
+                f"[WARNING] STALE cached {label} report parsed: {len(rows)} {unit}, {stale.describe()}. "
+                "The exports carry data that old."
+            )
+            return rows
 
+    def download_ready_report(
+        self,
+        report: dict[str, Any],
+        request: CachedReportRequest,
+        cache_path: Path,
+        label: str,
+        parser,
+        unit: str,
+    ) -> list[list[Any]]:
         download_url = first_present(report, "downloadUrl", "downloadURL", "download_url")
         if not download_url:
             download_url = find_link_href(report, "download")
         if not download_url:
-            download_url = f"https://marketplace.walmartapis.com/v3/reports/downloadReport?requestId={quote(request_id, safe='')}"
+            download_url = f"https://marketplace.walmartapis.com/v3/reports/downloadReport?requestId={quote(request.request_id, safe='')}"
 
         report_response = self._download_report(str(download_url))
-        rows = parse_inventory_report(report_response.content)
-        print(f"Inventory report parsed: {len(rows)} SKUs fetched.")
-        save_cached_report_request_id(INVENTORY_REPORT_REQUEST_ID_PATH, str(request_id))
+        rows = parser(report_response.content)
+        print(f"{label.title()} report parsed: {len(rows)} {unit}, {request.describe()}.")
+        save_cached_report_request_id(cache_path, request.request_id, request.requested_at)
         return rows
 
     def request_report(
@@ -180,11 +265,13 @@ class WalmartClient:
         report_version: str,
         cache_path: Path,
         label: str,
-    ) -> tuple[dict[str, Any], str]:
+        max_rate_limit_retries: int | None = None,
+    ) -> tuple[dict[str, Any], CachedReportRequest]:
         access_token = self.get_token()
         headers = self._auth_headers(access_token, accept="application/json")
         headers["Content-Type"] = "application/json"
 
+        rate_limit_retries = 0
         while True:
             try:
                 response = self._request(
@@ -196,6 +283,13 @@ class WalmartClient:
                 )
                 break
             except RateLimitedWalmartError as exc:
+                rate_limit_retries += 1
+                if max_rate_limit_retries is not None and rate_limit_retries > max_rate_limit_retries:
+                    print(
+                        f"[WARNING] {label.title()} report creation still rate-limited after "
+                        f"{max_rate_limit_retries} retries; giving up on a fresh report: {exc}"
+                    )
+                    raise
                 print(
                     f"[WARNING] {label.title()} report creation rate-limited; sleeping "
                     f"{REPORT_RATE_LIMIT_SLEEP_SECONDS} seconds: {exc}"
@@ -207,10 +301,11 @@ class WalmartClient:
         if not request_id:
             raise RuntimeError(f"{label.title()} report request did not return a request ID: {payload}")
 
-        print(f"{label.title()} report requested: {request_id}")
-        save_cached_report_request_id(cache_path, str(request_id))
+        requested_at = datetime.now().astimezone()
+        print(f"{label.title()} report requested: {request_id} at {requested_at:%Y-%m-%d %H:%M}")
+        save_cached_report_request_id(cache_path, str(request_id), requested_at)
         report = self.wait_for_report(request_id, label)
-        return report, str(request_id)
+        return report, CachedReportRequest(str(request_id), requested_at)
 
     def try_download_cached_report(
         self,
@@ -228,7 +323,6 @@ class WalmartClient:
             print(f"[WARNING] Cached report is not directly downloadable yet: {exc}")
             return None
 
-        print(f"Cached report parsed: {len(rows)} rows fetched.")
         return rows
 
     def wait_for_report(self, request_id: str, label: str) -> dict[str, Any]:
@@ -397,47 +491,15 @@ class WalmartClient:
         return self.fetch_prices_from_report()
 
     def fetch_prices_from_report(self) -> list[list[str]]:
-        cached_request_id = load_cached_report_request_id(
-            ITEM_REPORT_REQUEST_ID_PATH,
-            "WALMART_ITEM_REPORT_REQUEST_ID",
+        return self.fetch_report_rows(
+            report_type="ITEM",
+            report_version="v4",
+            cache_path=ITEM_REPORT_REQUEST_ID_PATH,
+            env_var_name="WALMART_ITEM_REPORT_REQUEST_ID",
+            label="item",
+            parser=parse_item_price_report,
+            unit="prices",
         )
-        report: dict[str, Any] | None = None
-        request_id: str | None = None
-        if cached_request_id:
-            print(f"Resuming item report request: {cached_request_id}")
-            cached_rows = self.try_download_cached_report(cached_request_id, parse_item_price_report)
-            if cached_rows is not None:
-                return cached_rows
-
-            try:
-                report = self.wait_for_report(cached_request_id, "item")
-                request_id = cached_request_id
-            except RuntimeError as exc:
-                print(
-                    f"[WARNING] Cached item report request {cached_request_id} is no longer "
-                    f"usable; discarding it and requesting a fresh report: {exc}"
-                )
-                clear_cached_report_request_id(ITEM_REPORT_REQUEST_ID_PATH)
-
-        if report is None or request_id is None:
-            report, request_id = self.request_report(
-                report_type="ITEM",
-                report_version="v4",
-                cache_path=ITEM_REPORT_REQUEST_ID_PATH,
-                label="item",
-            )
-
-        download_url = first_present(report, "downloadUrl", "downloadURL", "download_url")
-        if not download_url:
-            download_url = find_link_href(report, "download")
-        if not download_url:
-            download_url = f"https://marketplace.walmartapis.com/v3/reports/downloadReport?requestId={quote(request_id, safe='')}"
-
-        report_response = self._download_report(str(download_url))
-        rows = parse_item_price_report(report_response.content)
-        print(f"Item report parsed: {len(rows)} prices fetched.")
-        save_cached_report_request_id(ITEM_REPORT_REQUEST_ID_PATH, str(request_id))
-        return rows
 
     def fetch_prices_from_paginated_api(self) -> list[list[str]]:
         access_token = self.get_token()
@@ -605,21 +667,66 @@ def parse_item_price_report(content: bytes) -> list[list[str]]:
     return [[sku, prices[sku]] for sku in sorted(prices)]
 
 
-def load_cached_report_request_id(path: Path, env_var_name: str) -> str | None:
+def report_cache_max_age() -> timedelta:
+    """How old a cached report request may be and still be resumed rather than replaced."""
+    raw = os.getenv(REPORT_CACHE_MAX_AGE_ENV_VAR, "").strip()
+    hours = REPORT_CACHE_MAX_AGE_HOURS
+    if raw:
+        try:
+            hours = float(raw)
+            if hours < 0:
+                raise ValueError("negative")
+        except ValueError:
+            print(
+                f"[WARNING] {REPORT_CACHE_MAX_AGE_ENV_VAR}={raw!r} is not a number of hours; "
+                f"using the default {REPORT_CACHE_MAX_AGE_HOURS:g} h."
+            )
+            hours = REPORT_CACHE_MAX_AGE_HOURS
+    return timedelta(hours=hours)
+
+
+def format_age(age: timedelta) -> str:
+    minutes = age.total_seconds() / 60
+    if abs(minutes) < 90:
+        return f"{minutes:.0f} min"
+    return f"{minutes / 60:.1f} h"
+
+
+def load_cached_report_request(path: Path, env_var_name: str) -> CachedReportRequest | None:
     env_request_id = os.getenv(env_var_name, "").strip()
     if env_request_id:
-        return env_request_id
+        return CachedReportRequest(env_request_id, None)
 
     if not path.exists():
         return None
 
-    request_id = path.read_text(encoding="utf-8").strip()
-    return request_id or None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    request_id = lines[0].strip() if lines else ""
+    if not request_id:
+        return None
+
+    requested_at: datetime | None = None
+    if len(lines) > 1 and lines[1].strip():
+        try:
+            requested_at = datetime.fromisoformat(lines[1].strip())
+        except ValueError:
+            requested_at = None
+        if requested_at is not None and requested_at.tzinfo is None:
+            requested_at = requested_at.astimezone()
+    if requested_at is None:
+        # A one-line ID file from before the request time was recorded: the file's modified
+        # time is the closest thing to the request time.
+        requested_at = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+    return CachedReportRequest(request_id, requested_at)
 
 
-def save_cached_report_request_id(path: Path, request_id: str) -> None:
+def save_cached_report_request_id(path: Path, request_id: str, requested_at: datetime | None = None) -> None:
+    """Line 1 the request ID, line 2 the request time (ISO 8601 with offset). The time decides
+    whether a later run resumes this request or treats its data as stale."""
+    if requested_at is None:
+        requested_at = datetime.now().astimezone()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(request_id, encoding="utf-8")
+    path.write_text(f"{request_id}\n{requested_at.isoformat(timespec='seconds')}\n", encoding="utf-8")
 
 
 def clear_cached_report_request_id(path: Path) -> None:
