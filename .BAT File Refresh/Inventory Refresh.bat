@@ -34,14 +34,14 @@ rem crashed run never leaves a stale lock behind.
 set "gotlock="
 2>nul ( 9>"%lockfile%" ( set "gotlock=1" & call :run ) )
 if not defined gotlock (
-    >> "%logfile%" echo %date% %time%  already running - this call skipped
+    >> "%logfile%" echo %date% %time%  already running - this call skipped on %COMPUTERNAME%
     exit /b 2
 )
 exit /b %rc%
 
 :run
 >> "%runlog%" echo.
->> "%runlog%" echo Starting Script at %date% %time%
+>> "%runlog%" echo Starting Script at %date% %time% on %COMPUTERNAME%
 call :pick_python
 if not defined py (
     >> "%runlog%" echo ERROR: no Python with pandas and requests found - tried py -3.10, py, python, C:\Program Files\Python310 - main.py NOT run
@@ -52,7 +52,7 @@ if not defined py (
 %py% -u -X utf8 "%script%" >> "%runlog%" 2>&1
 set "rc=%errorlevel%"
 :finish
->> "%runlog%" echo Finished at %date% %time% with exit code %rc%
+>> "%runlog%" echo Finished at %date% %time% with exit code %rc% on %COMPUTERNAME%
 type "%runlog%" >> "%logfile%" && del "%runlog%"
 goto :eof
 

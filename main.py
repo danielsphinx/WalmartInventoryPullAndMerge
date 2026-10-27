@@ -4,6 +4,7 @@ import csv
 import io
 import os
 import time
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -100,17 +101,21 @@ class WalmartConfig:
     def from_environment(cls) -> "WalmartConfig":
         authorization = os.getenv("Walmart_Authorization", "").strip()
         correlation_id = os.getenv("WM_QOS_CORRELATION_ID", "").strip()
-        missing = []
 
         if not authorization:
-            missing.append("Walmart_Authorization")
+            raise RuntimeError("Missing required environment variable(s): Walmart_Authorization")
         if not correlation_id:
-            missing.append("WM_QOS_CORRELATION_ID")
-        if missing:
-            joined = ", ".join(missing)
-            raise RuntimeError(f"Missing required environment variable(s): {joined}")
+            # Walmart documents WM_QOS.CORRELATION_ID as a GUID unique to each request; it is not a secret.
+            # Without the variable (the robot DESKTOP-M8PEG74 has none) each header set main.py builds gets a
+            # fresh one (a set is reused for that phase's retries, polls and pages).
+            computer = os.getenv("COMPUTERNAME", "this computer")
+            print(f"[INFO] WM_QOS_CORRELATION_ID is not set on {computer}; generated ids are sent instead.")
 
         return cls(authorization=authorization, correlation_id=correlation_id)
+
+    def qos_id(self) -> str:
+        """The WM_QOS.CORRELATION_ID header value: the environment's value when set, else a new GUID."""
+        return self.correlation_id or str(uuid.uuid4())
 
 
 class WalmartClient:
@@ -122,7 +127,7 @@ class WalmartClient:
         headers = {
             "Authorization": self.config.authorization,
             "Content-Type": "application/x-www-form-urlencoded",
-            "WM_QOS.CORRELATION_ID": self.config.correlation_id,
+            "WM_QOS.CORRELATION_ID": self.config.qos_id(),
             "WM_SVC.NAME": SERVICE_NAME,
         }
         response = self._request(
@@ -375,7 +380,7 @@ class WalmartClient:
         access_token = self.get_token()
         auth_headers = {
             "WM_SEC.ACCESS_TOKEN": access_token,
-            "WM_QOS.CORRELATION_ID": self.config.correlation_id,
+            "WM_QOS.CORRELATION_ID": self.config.qos_id(),
             "WM_SVC.NAME": SERVICE_NAME,
         }
 
@@ -544,7 +549,7 @@ class WalmartClient:
     def _auth_headers(self, access_token: str, accept: str) -> dict[str, str]:
         return {
             "WM_SEC.ACCESS_TOKEN": access_token,
-            "WM_QOS.CORRELATION_ID": self.config.correlation_id,
+            "WM_QOS.CORRELATION_ID": self.config.qos_id(),
             "WM_SVC.NAME": SERVICE_NAME,
             "Accept": accept,
         }
@@ -908,22 +913,46 @@ def validate_inventory_completeness(
     )
 
 
+def temporary_beside(path: Path) -> Path:
+    # Each export is written here first and moved over its real name only when complete, so a reader (the
+    # converter, Lag Time Bulk, the ShipStation pusher) never reads a half written file. The "~$" prefix
+    # keeps Google Drive from syncing the temporary file.
+    return path.with_name(f"~${path.stem}.tmp")
+
+
+def move_into_place(temp: Path, path: Path, retry_seconds: int = 60) -> None:
+    # os.replace is atomic on one volume; on Windows it fails while a reader holds the target open, so retry.
+    deadline = time.monotonic() + retry_seconds
+    while True:
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(2)
+
+
 def write_inventory_csv(sku_quantity_data: list[list[Any]], path: Path = QTY_OUTPUT_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
+    temp = temporary_beside(path)
+    with temp.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(["sku", "availToSellQty"])
         writer.writerows(sku_quantity_data)
+    move_into_place(temp, path)
 
     print(f"Inventory CSV written: {path}")
 
 
 def write_price_csv(sku_amount_data: list[list[str]], path: Path = PRICES_OUTPUT_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
+    temp = temporary_beside(path)
+    with temp.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(["SKU", "Amount"])
         writer.writerows(sku_amount_data)
+    move_into_place(temp, path)
 
     print(f"Price CSV written: {path}")
 
@@ -952,7 +981,9 @@ def write_merged_csv(
     merged = merged.drop(columns=["SKU"])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_csv(output_path, encoding="utf-8", index=False)
+    temp = temporary_beside(output_path)
+    merged.to_csv(temp, encoding="utf-8", index=False)
+    move_into_place(temp, output_path)
     print(f"Merged CSV written: {output_path}")
 
 
