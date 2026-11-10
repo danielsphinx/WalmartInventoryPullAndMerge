@@ -9,6 +9,10 @@
                                                     ATTENTION is late orders, 1 for any other ATTENTION
     python walmart_jobs.py seed                     mark the current batch and tracking rows as already sent
 
+Exit codes of every job: 0 done; 1 a fault the log names; 2 G: is not reachable; 3 status only, late orders are
+the only ATTENTION; 4 the job raised, or a live state file did not parse; 5 orders, tracking and feedstatus
+only, Walmart could not be reached and nothing else was wrong.
+
 The inventory and price export runs main.py through .BAT File Refresh\\Inventory Refresh.bat --worker in a
 hidden cmd.exe: the BAT holds the lock and writes Bat Walmart Logs.txt, where `status` reads the exit code.
 A task must not use conhost --headless for this: from 2026-10-23 17:50 it exited 0 every hour and never
@@ -61,7 +65,9 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -78,6 +84,26 @@ ORDERS_CSV = Path(r"G:\Automation Google Drive\Google Sheet Connected CSVs\Pendi
                   r"\Raw Walmart Orders With JSON Headers.csv")
 AUTO_CANCEL_DAYS = 4  # Walmart auto cancels an order not marked Shipped by its Expected Ship Date plus four days
 STATUS_LATE_ONLY = 3  # status's exit code when late orders are its only ATTENTION (2 is "G: unreachable")
+EXIT_CRASH = 4        # a job raised, or a live state file did not parse (before 2026-11-10 both exited 1)
+EXIT_UNREACHABLE = 5  # orders, tracking, feedstatus: the only fault was that Walmart could not be reached
+STATE_LOCK_WAIT_S = 30
+SAVE_AFTER_SEND_S = 90  # how long a live upload step keeps trying to save its result before it writes a fallback file
+_STATE_SECTIONS = ("batches", "feeds", "orders", "tracking", "runs")
+# Walmart could not be reached or did not answer: DNS, connect, dropped connection, timeout. Not a certificate
+# fault and not "too many 5xx replies" (Walmart answered), which requests also reports under ConnectionError.
+_UNREACHABLE = re.compile(r"getaddrinfo failed|NameResolutionError|Failed to establish a new connection|ConnectTimeout"
+                          r"|Connection aborted|RemoteDisconnected|Read timed out|ConnectionResetError|ConnectionRefusedError"
+                          r"|WinError 1006[01]|WinError 10054|ChunkedEncodingError|IncompleteRead|SSLEOFError"
+                          r"|ConnectionError", re.I)
+_ANSWERED = re.compile(r"SSLCertVerificationError|CERTIFICATE_VERIFY_FAILED|ResponseError", re.I)
+# where a live step's result goes when neither the state nor the log folder on G: can be written
+LOCAL_UNSAVED = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "walmart_jobs"
+
+
+def unreachable(problem) -> bool:
+    text = str(problem)
+    return bool(_UNREACHABLE.search(text)) and not _ANSWERED.search(text)
+
 
 STEPS = (  # (marker key, script, entry function, the file it reads)
     ("zero_quantity", "Update Inventory.py", "makescriptnamed", "Delete Merged.csv"),
@@ -131,9 +157,11 @@ class Paths:
     """Every location the runner touches; tests point it at a temporary directory."""
 
     def __init__(self, logs: Path = LOGS, walmart_dir: Path = WALMART_DIR, export: Path = MERGED_EXPORT,
-                 pusher_log: Path = PUSHER_LOG, project: Path = HERE, orders_csv: Path = ORDERS_CSV):
+                 pusher_log: Path = PUSHER_LOG, project: Path = HERE, orders_csv: Path = ORDERS_CSV, local: Path | None = None):
         self.logs, self.walmart_dir, self.export, self.pusher_log, self.project = logs, walmart_dir, export, pusher_log, project
         self.orders_csv = orders_csv
+        # this PC's own disk, for the one file that must be writable when G: is not (tests: beside their logs folder)
+        self.local = local or (LOCAL_UNSAVED if logs == LOGS else logs.parent / "local")
         self.marker = walmart_dir / MARKER_NAME
         self.jobs_log = logs / "walmart_jobs.log"
         self.status = logs / "walmart_jobs_status.txt"
@@ -148,24 +176,229 @@ class Paths:
 
 # ------------------------------------------------------------------------------------------ state, log
 
-def load_state(path: Path) -> dict:
+# Several jobs share one state file, each under its own job lock (uploads, orders and tracking share the dry
+# file; export, feedstatus, uploads, orders, tracking and seed share the live one). On 2026-11-04 19:37 two dry
+# jobs wrote the file through one temp name at the same moment; it was left with a second closing brace and
+# every uploads, orders, tracking and status run crashed for six days. Since 2026-11-10:
+#   - one lock per state file, held only for a read, or for a read, merge and write; never across a Walmart
+#     call or a child process;
+#   - a save writes this job's own changes onto what is on disk now, so another job's keys survive;
+#   - each writer has its own temp name;
+#   - a state file that does not parse raises StateUnreadable. A dry file is set aside and the run goes on
+#     empty. A live file is never reset: an empty live state would send the current batch again.
+
+class StateUnreadable(RuntimeError):
+    """A state file exists and is not the JSON object this program wrote."""
+
+
+class State(dict):
+    base: str | None = None  # the state as it was loaded or last saved, as JSON: what a save compares against
+
+
+@contextlib.contextmanager
+def state_lock(path: Path, wait_s: float | None = None):
+    """The lock of one state file. Waits up to wait_s (STATE_LOCK_WAIT_S) for another job's read or save to finish."""
+    import msvcrt
+    wait_s = STATE_LOCK_WAIT_S if wait_s is None else wait_s
+    handle = path.with_name(path.name + ".lock").open("a+")
+    deadline = time.monotonic() + wait_s
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{path.name}: the state lock stayed busy for {wait_s:.0f} s") from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
+
+
+def _read_state(path: Path) -> dict:
+    try:
+        data = path.read_bytes()
     except FileNotFoundError:
-        state = {}
-    for key, default in (("batches", {}), ("feeds", {}), ("feed_results", []), ("orders", {}), ("tracking", {}), ("runs", {})):
-        state.setdefault(key, default)
+        return {}
+    if not data.strip():
+        raise StateUnreadable(f"{path.name}: the file is empty")
+    try:
+        state = json.loads(data.decode("utf-8"))
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError are both ValueError
+        raise StateUnreadable(f"{path.name}: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(state, dict):
+        raise StateUnreadable(f"{path.name}: holds a {type(state).__name__}, not an object")
+    for key in _STATE_SECTIONS:
+        if not isinstance(state.get(key, {}), dict):
+            raise StateUnreadable(f"{path.name}: \"{key}\" is a {type(state[key]).__name__}, not an object")
+    if not isinstance(state.get("feed_results", []), list):
+        raise StateUnreadable(f"{path.name}: \"feed_results\" is a {type(state['feed_results']).__name__}, not a list")
     return state
 
 
+def _new_state(raw: dict | None = None) -> State:
+    state = State(raw or {})
+    for key in _STATE_SECTIONS:
+        state.setdefault(key, {})
+    state.setdefault("feed_results", [])
+    state.base = json.dumps(state, sort_keys=True)
+    return state
+
+
+def load_state(path: Path, reset_corrupt: bool = False, log: "Log | None" = None) -> State:
+    """Read a state file. reset_corrupt is for the dry file only: set an unreadable file aside and start empty."""
+    with state_lock(path):
+        try:
+            raw = _read_state(path)
+        except StateUnreadable as exc:
+            if not reset_corrupt:
+                raise
+            stamp, n = f"{path.name}.corrupt-{now():%Y%m%dT%H%M%S}", 0
+            aside = path.with_name(stamp)
+            while aside.exists():  # never overwrite an earlier set aside file
+                n += 1
+                aside = path.with_name(f"{stamp}-{n}")
+            os.rename(path, aside)
+            if log:
+                log.line("state", "state_unreadable", f"{exc}; moved to {aside.name}; this dry run continues with an empty state")
+            raw = {}
+    return _new_state(raw)
+
+
+_GONE = object()
+
+
+def _adopt(mine: dict, theirs: dict) -> None:
+    """Make `mine` equal `theirs` without replacing `mine` or any dict inside it that both hold."""
+    for key in [k for k in mine if k not in theirs]:
+        del mine[key]
+    for key, value in theirs.items():
+        if isinstance(mine.get(key), dict) and isinstance(value, dict):
+            _adopt(mine[key], value)
+        else:
+            mine[key] = value
+
+
+def _merge_dict(mine: dict, old: dict, theirs: dict) -> None:
+    """Three way merge, in place, at every depth. Per key: a value this job did not change takes what is on disk
+    (another job's change, addition or removal). A value this job changed, added or removed stands, except that
+    where both sides hold a dict the merge goes one level down, so two jobs that changed different steps of one
+    batch both keep their step."""
+    for key in set(old) | set(theirs):
+        m, o, t = mine.get(key, _GONE), old.get(key, _GONE), theirs.get(key, _GONE)
+        if m == o:
+            if t is _GONE:
+                mine.pop(key, None)
+            elif isinstance(m, dict) and isinstance(t, dict):
+                _adopt(m, t)
+            else:
+                mine[key] = t
+        elif isinstance(m, dict) and isinstance(t, dict):
+            _merge_dict(m, o if isinstance(o, dict) else {}, t)
+
+
+def _merge(state: dict, base: dict, disk: dict) -> None:
+    """Bring into `state` what other jobs saved since `base`. Dicts are changed in place and never replaced: a
+    job holds references into the state (a batch, a step record) across saves."""
+    def without_results(d: dict) -> dict:
+        return {k: v for k, v in d.items() if k != "feed_results"}
+
+    results = state["feed_results"]
+    _merge_dict(state, without_results(base), without_results(disk))  # every top level key, known to this version or not
+    state["feed_results"] = results
+    mine, old_results = results, base.get("feed_results") or []
+    # this job only appends: what it added is what follows the entries it loaded (by position, so an entry equal
+    # to an older one is kept); if the head no longer matches, fall back to the entries that are not in the base
+    added = mine[len(old_results):] if mine[:len(old_results)] == old_results else [r for r in mine if r not in old_results]
+    mine[:] = disk["feed_results"] + added
+
+
+def _replace(temp: Path, path: Path) -> None:
+    for attempt in range(10):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:  # a reader has the file open for a moment (Windows)
+            if attempt == 9:
+                raise
+            time.sleep(0.1)
+
+
 def save_state(path: Path, state: dict) -> None:
-    batches = state["batches"]
-    for old in sorted(batches)[:-KEEP_BATCHES]:
-        del batches[old]
-    state["feed_results"] = state["feed_results"][-KEEP_FEED_RESULTS:]
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
-    os.replace(temp, path)
+    with state_lock(path):
+        base = getattr(state, "base", None)
+        before = json.dumps(state) if base is not None else None
+        temp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            if base is not None and path.exists():  # a file that is gone is not "another job removed every key": write this job's state
+                _merge(state, json.loads(base), _new_state(_read_state(path)))
+            batches = state["batches"]
+            for old in sorted(batches)[:-KEEP_BATCHES]:
+                del batches[old]
+            state["feed_results"][:] = state["feed_results"][-KEEP_FEED_RESULTS:]
+            temp.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+            _replace(temp, path)
+        except BaseException:
+            if before is not None:  # a save that failed leaves the state as the job had it, so a later save merges once, not twice
+                _adopt(state, json.loads(before))
+            raise
+        finally:
+            with contextlib.suppress(OSError):
+                temp.unlink()
+    if isinstance(state, State):
+        state.base = json.dumps(state, sort_keys=True)
+
+
+def unsaved_files(paths: "Paths") -> list[Path]:
+    found = []
+    for folder in (paths.logs, paths.local):
+        with contextlib.suppress(OSError):
+            found += sorted(folder.glob("walmart_jobs_unsaved.*.json"))
+    return found
+
+
+def save_after_send(paths: "Paths", state_path: Path, state: dict, log: "Log", step: str, batch: str, record: dict) -> None:
+    """Save the state after a live step ran. The step may have reached Walmart, so losing this save would let the
+    next run send the step again. Keep trying for SAVE_AFTER_SEND_S, whatever the save raises; if it still fails,
+    write the step's record to walmart_jobs_unsaved.<pid>.json beside the state file, or on this PC's own disk
+    (paths.local) when G: cannot be written, or to stderr as the last resort, and raise the save's error.
+    uploads() refuses to run while such a file exists, and status reports it."""
+    deadline, problem = time.monotonic() + SAVE_AFTER_SEND_S, None
+    while True:
+        try:
+            save_state(state_path, state)
+            return
+        except Exception as exc:  # noqa: BLE001  (any failure here leaves a sent step unrecorded)
+            problem = exc
+            if isinstance(exc, StateUnreadable) or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+    why = f"{type(problem).__name__}: {problem}"
+    text = json.dumps({"written": iso(now()), "state_file": state_path.name, "batch": batch, "step": step,
+                       "record": record, "problem": why}, indent=1, default=str)
+    where = None
+    for folder in (paths.logs, paths.local):
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"walmart_jobs_unsaved.{os.getpid()}.json").write_text(text, encoding="utf-8")
+            where = folder / f"walmart_jobs_unsaved.{os.getpid()}.json"
+            break
+        except Exception:  # noqa: BLE001  (try the next place)
+            continue
+    if where is None:
+        print(f"[ATTENTION] an upload step ran and its result could be written nowhere:\n{redact(text)}", file=sys.stderr)
+    with contextlib.suppress(Exception):  # the log is on G: too: its failure must not hide the save's error
+        log.line(step, "state_not_saved", f"[ATTENTION] step {step} of batch {batch} ran and its result could not be saved "
+                 f"({why}); it is in {where or 'stderr only'}; uploads stay stopped until that record is entered into the "
+                 "state by hand and the file removed", batch=batch)
+    raise problem
 
 
 class Log:
@@ -341,7 +574,11 @@ def new_batch(marker: dict, paths: Paths) -> dict:
 
 def uploads(paths: Paths, dry: bool, log: Log, runner=run_child) -> int:
     state_path = paths.state(dry)
-    state = load_state(state_path)
+    if not dry and unsaved_files(paths):
+        log.line("uploads", "stopped", "[ATTENTION] " + ", ".join(p.name for p in unsaved_files(paths)) + ": an earlier upload "
+                 "step ran and its result is not in the state; nothing is uploaded until it is entered by hand and the file removed")
+        return 1
+    state = load_state(state_path, reset_corrupt=dry, log=log)
     state["runs"]["uploads"] = iso(now())
     marker = read_marker(paths.marker)
     if marker is None:
@@ -386,11 +623,14 @@ def uploads(paths: Paths, dry: bool, log: Log, runner=run_child) -> int:
         record.update({"outcome": result.outcome, "detail": result.detail, "at": iso(now()), "feed_ids": result.feed_ids})
         if "429" in result.detail and result.outcome == "failed_before_send":
             record["not_before"] = iso(now() + _dt.timedelta(minutes=THROTTLE_WAIT_MIN))
-        log.line(key, result.outcome, result.detail, result.tail, batch=marker["run_time"])
-        if not dry:
+        # save first, log second: the step may have reached Walmart, and a log line that fails must not lose its record
+        if dry:
+            save_state(state_path, state)
+        else:
             for feed_id in result.feed_ids:
                 state["feeds"][feed_id] = {"step": key, "batch": marker["run_time"], "posted": iso(now())}
-        save_state(state_path, state)
+            save_after_send(paths, state_path, state, log, key, marker["run_time"], record)
+        log.line(key, result.outcome, result.detail, result.tail, batch=marker["run_time"])
         if result.outcome == "gate_refused":
             failed = True
             break
@@ -413,9 +653,13 @@ def export(paths: Paths, log: Log, bat: Path = BAT) -> int:
     outcome = {0: "done", 2: "skipped"}.get(code, "failed")
     log.line("export", outcome, f"Inventory Refresh.bat --worker started {started}, exit {code}"
              + (" (another run holds the lock)" if code == 2 else ""))
-    state = load_state(paths.state(False))
-    state["runs"]["export"] = iso(now())
-    save_state(paths.state(False), state)
+    try:
+        state = load_state(paths.state(False))
+        state["runs"]["export"] = iso(now())
+        save_state(paths.state(False), state)
+    except (StateUnreadable, TimeoutError, OSError) as exc:  # the export itself ran: keep its exit code, and say what is wrong with the state
+        log.line("export", "state_unreadable", f"[ATTENTION] live state file unreadable: {type(exc).__name__}: {exc}; "
+                 "the export's run time was not recorded")
     return 0 if code in (0, 2) else 1
 
 
@@ -423,7 +667,7 @@ def export(paths: Paths, log: Log, bat: Path = BAT) -> int:
 
 def orders(paths: Paths, dry: bool, log: Log, runner=run_child) -> int:
     state_path = paths.state(dry)
-    state = load_state(state_path)
+    state = load_state(state_path, reset_corrupt=dry, log=log)
     code, rows, output = runner(paths, ["orders"], dry, TIMEOUTS["orders"], "orders")
     end = next((r for r in reversed(rows) if r.get("event") == "end"), {})
     record = state["orders"]
@@ -435,7 +679,7 @@ def orders(paths: Paths, dry: bool, log: Log, runner=run_child) -> int:
     else:
         record["last_fail"], record["last_error"] = iso(now()), end.get("error") or f"exit {code}"
         log.line("orders", "failed", record["last_error"], tail_of(output))
-        rc = 1
+        rc = EXIT_UNREACHABLE if unreachable(record["last_error"]) else 1
     state["runs"]["orders"] = iso(now())
     save_state(state_path, state)
     return rc
@@ -449,7 +693,7 @@ def tracking_csv(paths: Paths) -> Path:
 
 def tracking(paths: Paths, dry: bool, log: Log, force: bool = False, runner=run_child, csv_path: Path | None = None) -> int:
     state_path = paths.state(dry)
-    state = load_state(state_path)
+    state = load_state(state_path, reset_corrupt=dry, log=log)
     record = state["tracking"]
     last = parse_iso(record.get("last_attempt"))
     if not force and last and (now() - last).total_seconds() < TRACKING_EVERY_S:
@@ -471,7 +715,7 @@ def tracking(paths: Paths, dry: bool, log: Log, force: bool = False, runner=run_
     else:
         record.update({"last_outcome": "failed", "last_error": end.get("error") or f"exit {code}", "last_fail": iso(now())})
         log.line("tracking", "failed", record["last_error"], tail_of(output))
-        rc = 1
+        rc = EXIT_UNREACHABLE if unreachable(record["last_error"]) else 1
     state["runs"]["tracking"] = iso(now())
     save_state(state_path, state)
     return rc
@@ -487,13 +731,17 @@ def feedstatus(paths: Paths, log: Log, fetch=None) -> int:
         save_state(state_path, state)
         return 0
     fetch = fetch or _fetch_feed
-    rc = 0
+    rc, no_answer = 0, False
     for feed_id, info in list(state["feeds"].items()):
         try:
             data = fetch(feed_id)
         except Exception as exc:
-            log.line(info["step"], "feedstatus_error", f"{feed_id}: {type(exc).__name__}: {exc}")
-            rc = 1
+            problem = f"{type(exc).__name__}: {exc}"
+            log.line(info["step"], "feedstatus_error", f"{feed_id}: {problem}")
+            if unreachable(problem):
+                no_answer = True
+            else:
+                rc = 1
             continue
         status = str(data.get("feedStatus", "")).upper()
         received, failed = int(data.get("itemsReceived") or 0), int(data.get("itemsFailed") or 0)
@@ -513,7 +761,7 @@ def feedstatus(paths: Paths, log: Log, fetch=None) -> int:
             rc = 1
     state["runs"]["feedstatus"] = iso(now())
     save_state(state_path, state)
-    return rc
+    return rc or (EXIT_UNREACHABLE if no_answer else 0)
 
 
 def _fetch_feed(feed_id: str) -> dict:
@@ -603,7 +851,7 @@ def late_orders(orders_csv: Path, t: _dt.datetime) -> dict | None:
         return None
     ship_by = {}
     for r in rows:
-        with contextlib.suppress(KeyError, ValueError, TypeError):
+        with contextlib.suppress(KeyError, ValueError, TypeError, OverflowError, OSError):
             ship_by[r["purchaseOrderId"]] = _dt.datetime.fromtimestamp(int(r["estimatedShipDate"]) / 1000)
     late = sorted(d for d in ship_by.values() if d < t)
     soon = [d for d in ship_by.values() if t <= d < t + _dt.timedelta(hours=24)]
@@ -612,9 +860,48 @@ def late_orders(orders_csv: Path, t: _dt.datetime) -> dict | None:
 
 
 def status(paths: Paths, log: Log | None = None) -> int:
+    """Write walmart_jobs_status.txt. The file is written whatever the checks meet: a status file that stops being
+    rewritten reads as the last good verdict (2026-11-04 to 11-10)."""
     t = now()
-    live, dry = load_state(paths.state(False)), load_state(paths.state(True))
     attention, lines = [], [f"walmart jobs status written {iso(t)} on {socket.gethostname()}"]
+    late_attention = None
+    try:
+        late_attention = _status_checks(paths, t, attention, lines)
+    except Exception as exc:  # noqa: BLE001
+        attention.append(f"status could not finish its checks ({type(exc).__name__}: {exc}); the lines above are all it read")
+    if not attention:
+        verdict, rc = "OK", 0
+    elif attention == [late_attention]:
+        verdict, rc = "ATTENTION (late orders only)", STATUS_LATE_ONLY
+    else:
+        verdict, rc = "ATTENTION", 1
+    text = "\n".join(lines + [f"  [ATTENTION] {a}" for a in attention] + [f"verdict: {verdict}"]) + "\n"
+    temp = paths.status.with_name(f"{paths.status.name}.{os.getpid()}.tmp")
+    temp.write_text(text, encoding="utf-8")
+    _replace(temp, paths.status)
+    print(text, end="")
+    return rc
+
+
+def _status_checks(paths: Paths, t: _dt.datetime, attention: list, lines: list) -> str | None:
+    """Every check of status; fills attention and lines; returns the late order line when there is one."""
+    states, shown = [], []
+    for label, path in (("live", paths.state(False)), ("dry", paths.state(True))):
+        # status only reads: it reports a state file it cannot read and resets nothing. It must write its file even
+        # then, so a busy lock and a share error are caught here too.
+        try:
+            states.append(load_state(path))
+            shown.append((label, states[-1]))
+        except (StateUnreadable, TimeoutError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, (StateUnreadable, TimeoutError)) else f"{path.name}: {type(exc).__name__}: {exc}"
+            states.append(_new_state())
+            attention.append(f"state file unreadable: {reason}")
+            lines.append(f"{label} state: unreadable; its uploads, orders, tracking and feed lines are left out below")
+    live, dry = states
+    live_read = any(label == "live" for label, _ in shown)
+    for path in unsaved_files(paths):
+        attention.append(f"{path.name}: an upload step ran and its result is not in the state; uploads are stopped until "
+                         "it is entered by hand and the file removed")
 
     for name in ("Walmart_Authorization", "WM_QOS_CORRELATION_ID"):
         if not os.getenv(name):
@@ -629,8 +916,13 @@ def status(paths: Paths, log: Log | None = None) -> int:
     if export_age is None or export_age > ATTENTION_EXPORT_AGE_H:
         attention.append(f"the merged export is older than {ATTENTION_EXPORT_AGE_H} h")
 
-    marker = read_marker(paths.marker)
-    for label, state in (("live", live), ("dry", dry)):
+    marker, marker_fault = None, False
+    try:
+        marker = read_marker(paths.marker)
+    except Exception as exc:  # noqa: BLE001  (the converter may be writing it, or it holds bytes that do not decode)
+        marker_fault = True
+        attention.append(f"the marker file could not be read ({type(exc).__name__}: {exc})")
+    for label, state in shown:
         if not state["batches"]:
             lines.append(f"uploads ({label}): no batch yet")
             continue
@@ -648,10 +940,10 @@ def status(paths: Paths, log: Log | None = None) -> int:
         age_min = (t.timestamp() - marker["mtime"]) / 60
         if waiting and age_min > ATTENTION_MARKER_WAIT_MIN:
             attention.append(f"the converter's batch {marker['run_time']} has waited {age_min:.0f} min")
-    elif not marker:
+    elif not marker and not marker_fault:
         lines.append("uploads: no marker file yet (the converter does not write one)")
 
-    for label, state in (("live", live), ("dry", dry)):
+    for label, state in shown:
         o = state["orders"]
         if o:
             lines.append(f"orders ({label}): last ok {o.get('last_ok')}, last failure {o.get('last_fail')} {o.get('last_error') or ''}".rstrip())
@@ -659,7 +951,7 @@ def status(paths: Paths, log: Log | None = None) -> int:
     if live["runs"].get("orders") and (not ok or (t - ok).total_seconds() > ATTENTION_ORDERS_AGE_MIN * 60):
         attention.append(f"no successful order export in {ATTENTION_ORDERS_AGE_MIN} min")
 
-    for label, state in (("live", live), ("dry", dry)):
+    for label, state in shown:
         tr = state["tracking"]
         if tr:
             lines.append(f"tracking ({label}): {tr.get('last_outcome')} at {tr.get('last_ok') or tr.get('last_fail')}; {tr.get('last_summary', '')}")
@@ -667,7 +959,8 @@ def status(paths: Paths, log: Log | None = None) -> int:
         attention.append(f"tracking upload failed: {live['tracking'].get('last_error', '')[:160]}")
 
     recent = [r for r in live["feed_results"] if (parse_iso(r.get("checked")) or t) > t - _dt.timedelta(hours=24)]
-    lines.append(f"feeds: {len(live['feeds'])} awaiting Walmart, {len(recent)} finished in 24 h")
+    if live_read:
+        lines.append(f"feeds: {len(live['feeds'])} awaiting Walmart, {len(recent)} finished in 24 h")
     for r in recent:
         received, failed = r.get("itemsReceived") or 0, r.get("itemsFailed") or 0
         if not str(r.get("feedStatus")).startswith("PROCESSED") or (received and failed / received > ATTENTION_FEED_FAIL_RATIO):
@@ -677,10 +970,14 @@ def status(paths: Paths, log: Log | None = None) -> int:
     runs = [r for r in runs if r]
     if runs and (t - max(runs)).total_seconds() > ATTENTION_IDLE_H * 3600:
         attention.append(f"no Walmart job has run for {ATTENTION_IDLE_H} h (is Daniel logged on?)")
-    if dry["runs"] and (not live["runs"] or max(dry["runs"].values()) > max(live["runs"].values())):
+    if len(shown) == 2 and dry["runs"] and (not live["runs"] or max(dry["runs"].values()) > max(live["runs"].values())):
         lines.append("MODE: DRY RUN (shadow): nothing is being sent to Walmart by these jobs")
 
-    late = late_orders(paths.orders_csv, t)
+    try:
+        late = late_orders(paths.orders_csv, t)
+    except Exception as exc:  # noqa: BLE001  (the robot may be writing the file, or it holds bytes that do not parse)
+        late = None
+        attention.append(f"the order export could not be read, so late orders were not counted ({type(exc).__name__}: {exc})")
     late_attention = None  # the late order line, when there is one: alone it is exit 3, not 1
     if late is not None:
         lines.append(f"orders past Expected Ship Date: {late['late']} of {late['pending']} pending; {late['soon']} more due within 24 h")
@@ -693,19 +990,7 @@ def status(paths: Paths, log: Log | None = None) -> int:
     lines.append(f"ShipStation pusher: {store.strip()[:300] if store else 'no Walmart store check line found'}")
     gate = last_line_containing(paths.gate_log, " Update Inventory: ", window=400_000)
     lines.append(f"gate: last Update Inventory line {gate[:19] if gate else 'none'}")
-
-    if not attention:
-        verdict, rc = "OK", 0
-    elif attention == [late_attention]:
-        verdict, rc = "ATTENTION (late orders only)", STATUS_LATE_ONLY
-    else:
-        verdict, rc = "ATTENTION", 1
-    text = "\n".join(lines + [f"  [ATTENTION] {a}" for a in attention] + [f"verdict: {verdict}"]) + "\n"
-    temp = paths.status.with_name(paths.status.name + ".tmp")
-    temp.write_text(text, encoding="utf-8")
-    os.replace(temp, paths.status)
-    print(text, end="")
-    return rc
+    return late_attention
 
 
 # ------------------------------------------------------------------------------------------ main
@@ -740,9 +1025,17 @@ def main(argv=None, paths: Paths | None = None) -> int:
             if args.job == "seed":
                 return seed(paths, log)
             return status(paths, log)
+        except StateUnreadable as exc:
+            with contextlib.suppress(Exception):  # the log is on G: too: exit 4 whether or not the line could be written
+                log.line(args.job, "state_unreadable", f"[ATTENTION] {'dry' if dry else 'live'} state file unreadable: {exc}; this run stopped here; "
+                         + ("the next dry run sets the file aside and starts empty" if dry
+                            else "a live state file is never reset by the program: repair it by hand"))
+            return EXIT_CRASH
         except Exception as exc:
-            log.line(args.job, "crashed", f"{type(exc).__name__}: {exc}")
-            raise
+            tail = traceback.format_exc().splitlines()[-8:]
+            with contextlib.suppress(Exception):
+                log.line(args.job, "crashed", f"{type(exc).__name__}: {exc}", tail)
+            return EXIT_CRASH
 
 
 if __name__ == "__main__":
