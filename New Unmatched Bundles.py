@@ -133,6 +133,8 @@ def process_batch(batch):
             "country_of_origin_substantial_transformation": "United States"
         }
 
+        # Lag time: Walmart sets 0 (same day shipping) on an item sent without it; 1 is the most it allows without an exemption.
+        orderable["fulfillmentLagTime"] = 1  # lag-time
         if pd.notna(msrp):
             orderable["msrp"] = msrp
 
