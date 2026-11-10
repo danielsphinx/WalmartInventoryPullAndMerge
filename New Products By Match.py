@@ -31,6 +31,17 @@ def gettoken():
 
     return _http.token_from(response)  # feed-http
 
+# Lag time: MP_ITEM_MATCH has no field for it and Walmart creates a matched offer at 0 (same day shipping); this maintenance feed sets 1 on the same items. An item the match feed has not created yet is expected to fail here and to be set by a later cycle's resend of its row.
+def upload_lag_time(access_token, new_product_uploads):  # lag-time
+    url = "https://marketplace.walmartapis.com/v3/feeds?feedType=MP_MAINTENANCE"  # lag-time
+    headers = {'WM_SEC.ACCESS_TOKEN': access_token, 'WM_QOS.CORRELATION_ID': WM_QOS_CORRELATION_ID, 'WM_SVC.NAME': 'Walmart Marketplace', 'Content-Type': 'application/json'}  # lag-time
+    items = [{"Orderable": {"sku": u["Item"]["sku"], "productIdentifiers": u["Item"]["productIdentifiers"], "fulfillmentLagTime": 1}} for u in new_product_uploads]  # lag-time
+    payload = {"MPItemFeedHeader": {"businessUnit": "WALMART_US", "locale": "en", "version": "5.0.20260114-19_40_57-api"}, "MPItem": items}  # lag-time
+    response = walmart_post(url, kind="feed", headers=headers, data=json.dumps(payload))  # lag-time
+    print("Lag Time Response:", response.text)  # lag-time
+    if not 200 <= response.status_code < 300:  # lag-time
+        raise RuntimeError(f"MP_MAINTENANCE lag time feed not accepted: HTTP {response.status_code}: {response.text[:300]}")  # lag-time
+
 def upload_new_products(access_token, new_product_uploads):
     url = "https://marketplace.walmartapis.com/v3/feeds?feedType=MP_ITEM_MATCH"
     headers = {
@@ -71,6 +82,7 @@ def make_new_product_uploads(new_product_csv_path):
     # Set the batch size (e.g., 1000)
     batch_size = 1000
 
+    lag_time_error = None  # lag-time
     for i in range(0, len(new_product_data), batch_size):
         # Get a batch of rows
         batch = new_product_data[i:i+batch_size]
@@ -102,6 +114,13 @@ def make_new_product_uploads(new_product_csv_path):
 
         # Upload new products for this batch
         upload_new_products(access_token, new_product_uploads)
+        # A failed lag time feed must not stop the next batch's match feed: it is raised after the loop (a later match feed's failure, raised at once, is the one raised instead).
+        try:  # lag-time
+            upload_lag_time(access_token, new_product_uploads)  # lag-time
+        except Exception as exc:  # lag-time
+            lag_time_error = lag_time_error or exc  # lag-time
+    if lag_time_error is not None:  # lag-time
+        raise lag_time_error  # lag-time
 
 # Example usage
 #  make_new_product_uploads(r'import requests
