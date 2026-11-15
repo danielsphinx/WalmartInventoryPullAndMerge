@@ -39,6 +39,27 @@ def clean_nans(obj):
     return obj
 
 
+# Name limit: Walmart refuses a new item whose name is longer: "The attribute 'Product Name' cannot exceed 199 characters".
+NAME_LIMIT = 199  # name-limit
+# A name of 199 characters or fewer is sent unchanged. A longer one keeps the longest run of its leading " & "
+# fragments (at least one, not blank) that fits with " + More"; a name with no " & ", or whose first fragment
+# does not fit with it, is cut at its last space that leaves at most 199 characters, without trailing " &", ",", "-",
+# ":" or spaces. Never empty, never over 199. A name that is not a string (NaN) goes the old path. " & " also
+# occurs inside album and artist names ("Hall & Oates"), so no number of albums is stated and a cut can fall
+# inside such a name; only the converter, which holds the album list, can cut at album boundaries.
+def name_within_limit(name):  # name-limit
+    if not isinstance(name, str) or len(name) <= NAME_LIMIT:  # name-limit
+        return name  # name-limit
+    parts = name.split(" & ")  # name-limit
+    for keep in range(len(parts) - 1, 0, -1):  # name-limit
+        kept = " & ".join(parts[:keep])  # name-limit
+        short = kept + " + More"  # name-limit
+        if kept.strip() and len(short) <= NAME_LIMIT:  # name-limit
+            return short  # name-limit
+    space = name.rfind(" ", 0, NAME_LIMIT + 1)  # name-limit
+    cut = name[:space if space > 0 else NAME_LIMIT].rstrip(" &,-:")  # name-limit
+    return cut or name[:NAME_LIMIT]  # name-limit
+# (end of the name limit)
 def get_token():
     url = "https://marketplace.walmartapis.com/v3/token"
     payload = 'grant_type=client_credentials'
@@ -64,6 +85,9 @@ def new_products_full_data(csv_file_path):
     product_data = drop_retired_rows(product_data, 'sku', 'MP_ITEM New_Unmatched_Bundles_v5', _retired)  # never-relist-gate
     # Never relist gate, GTIN: drop a row whose GTIN is retired even when its SKU is new. The GTIN sent is productId; a '-B-' bundle is sent as CUSTOM, no GTIN.
     product_data = _gate.drop_retired_gtin_rows(product_data, [None if '-B-' in str(s) else g for s, g in zip(product_data['sku'], product_data['productId'])], 'MP_ITEM New_Unmatched_Bundles_v5', _retired)  # never-relist-gate
+    # Bundle component rule: a new bundle with a flagged component, or the albums of a flagged bundle, is dropped.
+    product_data = _gate.drop_bad_bundle_rows(product_data, 'MP_ITEM New_Unmatched_Bundles_v5')  # bundle-gate
+    _gate._write_log_line(f"{_gate.datetime.datetime.now().isoformat(timespec='seconds')} MP_ITEM New_Unmatched_Bundles_v5: shortened {sum(isinstance(n, str) and len(n) > NAME_LIMIT for n in product_data.get('productName', ()))} of {len(product_data)} product name(s) over {NAME_LIMIT} characters")  # name-limit
     print(product_data)
 
     batch_size = 1000
@@ -84,6 +108,7 @@ def process_batch(batch):
     for index, row in batch.iterrows():
         sku = row['sku']
         product_name = row['productName']
+        product_name = name_within_limit(product_name)  # name-limit
         short_description = row['shortDescription']
         main_image_url = row['mainImageUrl']
         price = row['price']

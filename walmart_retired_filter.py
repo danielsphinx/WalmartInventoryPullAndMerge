@@ -79,6 +79,29 @@ REFUSED line; an EXCEPTION line is not one) in 6 hours (schedule it, or tools/ga
 which runs it); --status never writes the log itself, so its own refusals cannot make the log look
 fresh.
 
+The bundle component rule (WO-52, owner ruling 2026-11-10). drop_bad_bundle_rows, called by the three
+MP_ITEM scripts right after the GTIN gate, drops a new bundle row (its canonical SKU holds "-b-", the
+test the scripts use to send a row as CUSTOM) whose components are bad. Its components are read from the
+row's shortDescription, the text Walmart receives: "This is a N ... bundle" and one "Barcode: <digits>"
+per component (case blind). The components are unknown, and the row is dropped, when it has no barcode,
+no stated count, a barcode count other than N, a "barcode" word without its digits, an all zero barcode,
+or a barcode written with separators (digits, then a space, comma, dot or hyphen, then digits); else a row
+is dropped when a barcode is a bad key ("bad component"), else when its barcode set equals a set of the
+album set file ("album set", whatever the order and whatever the SKU). Bad keys of every bad row: its
+gtin, the digits of an all digit SKU behind a letter prefix (AMS-081227946630 gives 81227946630) and the
+trailing 8 to 14 digits after the last hyphen of its SKU (AMS-NM-FILT-095163891012 gives 95163891012).
+Bad rows: retire_approved.csv rows with policy_flagged YES (case blind; the column is required, since
+its other rows, lack of stock, owner named or title words, are not bad), and every row of
+retire_flagged_offensive_approved.csv and of the two Walmart internal team hold lists
+(appeal_case_tier2.csv, wo28_hold_internal_team.csv). The album set file (retire_bundle_album_sets.csv:
+sku, component_gtins as digits separated by spaces, source) is written by the kit's
+tools/build_bundle_album_sets.py. The hold lists and the album set file are required inputs of this
+rule, in the same directory and with the same parse rules as the lists, and every row of a rule input
+must be as long as its header: one that is missing or defective refuses the run (REFUSED line,
+RuntimeError, nothing posted) unless the dated waiver holds. A dropped row is not a refusal: the log line
+counts the rows per reason and per source and names at most 20 of them. load_bundle_rule builds the rule;
+--status judges its inputs too.
+
 This file is tracked in the patch kit's owner_scripts/; tools/check_live_tree.py reads a deployment
 back.
 """
@@ -107,6 +130,10 @@ MIRROR_RETIRED_SKUS_DIR = r"G:\Python Projects\WalmartInventoryPullAndMerge\reti
 # in step by the compliance session after every push; used when the clone path above does not exist
 DEFAULT_LOG_PATH = r"G:\Documents And Logs\walmart_retired_filter.log"
 RETIRED_SKU_FILES = ("retire_approved.csv", "retire_flagged_offensive_approved.csv")
+# WO-52: the bundle component rule's other inputs, in the same directory (see the module doc)
+BUNDLE_HOLD_FILES = ("appeal_case_tier2.csv", "wo28_hold_internal_team.csv")
+BUNDLE_SET_FILE = "retire_bundle_album_sets.csv"
+BUNDLE_FLAGGED_ONLY = ("retire_approved.csv",)  # only its policy_flagged YES rows are bad; the column is required
 RETRY_ATTEMPTS = 3
 RETRY_SECONDS = 1.0       # WALMART_RETIRED_RETRY_SECONDS overrides it (the tests set 0)
 MAX_AGE_HOURS = 48.0      # WALMART_RETIRED_MAX_AGE_HOURS overrides it; 0 switches the age check off
@@ -277,6 +304,30 @@ def _signature(path: Path) -> tuple[int, int]:
     return (stat.st_size, stat.st_mtime_ns)
 
 
+def _parse_table(path: Path) -> tuple[list[str], list[list[str]]]:
+    """The header (lower case) and body rows of one list file, after every check _parse_list makes
+    of its shape. Raises ValueError naming the defect."""
+    text = path.read_bytes().decode("utf-8-sig")
+    if not text.strip():
+        raise ValueError("is empty (zero bytes, no header row)")
+    if not text.endswith(("\n", "\r")):
+        raise ValueError("looks cut short: it does not end with a line break")
+    rows = [row for row in csv.reader(io.StringIO(text, newline="")) if row]
+    header = [(h or "").strip().lower() for h in rows[0]]
+    if "sku" not in header:
+        raise ValueError(f"has no sku column (columns: {', '.join(header)})")
+    if header.count("sku") > 1:
+        raise ValueError("has more than one sku column; which one counts is not defined")
+    if header.count("gtin") > 1:
+        raise ValueError("has more than one gtin column; which one counts is not defined")
+    body = rows[1:]
+    if body and len(body[-1]) < len(header):
+        raise ValueError("looks cut short: its last row has fewer columns than the header")
+    if not any(canonical_sku(row[header.index("sku")]) for row in body if header.index("sku") < len(row)):
+        raise ValueError(f"holds no SKU ({'header only' if not body else f'{len(body)} rows, all blank'})")
+    return header, body
+
+
 def _parse_list(path: Path) -> tuple[list[str], dict, set[str]]:
     """The SKUs of one list file (as listed), what the read counted, and its GTINs (canonical; none
     when the file has no gtin column). Raises ValueError naming the defect."""
@@ -317,17 +368,18 @@ def _parse_list(path: Path) -> tuple[list[str], dict, set[str]]:
     return skus, {"rows": len(body), "skus": len(seen), "blank": blank, "duplicate": duplicate}, gtins
 
 
-def _read_list(path: Path) -> tuple[list[str], dict, set[str]]:
+def _read_list(path: Path, parser=None):
     """One list, read until two looks agree: a file that is missing or defective for the moment
     (the clone's puller replaces files), or that changed while it was being read, is read again
-    before it is believed. Raises OSError with the last reason once the attempts run out."""
+    before it is believed. Raises OSError with the last reason once the attempts run out. `parser`
+    is _parse_list unless given (the bundle rule reads the whole table with _parse_table)."""
     reason = "not read"
     for attempt in range(RETRY_ATTEMPTS):
         if attempt:
             time.sleep(_number("WALMART_RETIRED_RETRY_SECONDS", RETRY_SECONDS))
         try:
             before = _signature(path)
-            parsed = _parse_list(path)
+            parsed = (parser or _parse_list)(path)
             after = _signature(path)
         except FileNotFoundError:
             reason = "not found"
@@ -651,6 +703,198 @@ def drop_retired_gtin_rows(frame, gtins, label: str, retired: set[str] | None = 
 
 
 # --------------------------------------------------------------------------------------------------
+# the bundle component rule (WO-52)
+# --------------------------------------------------------------------------------------------------
+
+_DIGIT_SKU = re.compile(r"(?:[A-Za-z]+-)?([0-9]{8,14})")
+_SKU_TAIL = re.compile(r"-([0-9]{8,14})$")
+_BARCODE_WORD = re.compile(r"barcode", re.IGNORECASE)
+_BARCODE = re.compile(r"barcode:\s*([0-9]+)", re.IGNORECASE)
+_BARCODE_RUN_ON = re.compile(r"barcode:\s*[0-9]+[ ,.\-][0-9]", re.IGNORECASE)  # "81,227,946,630", "81 227 946 630"
+_STATED_COUNT = re.compile(r"This is a ([0-9]+) ")
+LOG_DROPPED_SHOWN = 20  # the log line names this many dropped rows, then "and N more"
+
+
+def component_keys(sku: object, gtin: object) -> set[str]:
+    """The keys a bad list row gives a component: its canonical GTIN, the digits of an all digit SKU behind
+    an optional letter prefix (AMS-081227946630 -> 81227946630), and the trailing 8 to 14 digits after the
+    last hyphen of any SKU (AMS-NM-FILT-095163891012 -> 95163891012): a bad row's own digits are a bad key."""
+    text = unicodedata.normalize("NFKC", str(sku or "")).strip()
+    keys = {canonical_gtin(gtin)}
+    for match in (_DIGIT_SKU.fullmatch(text), _SKU_TAIL.search(text)):
+        if match:
+            keys.add(canonical_gtin(match.group(1)))
+    keys.discard("")
+    return keys
+
+
+def is_bundle_sku(sku: object) -> bool:
+    """A bundle row: its canonical SKU holds "-b-", the test the scripts use to send it as CUSTOM (no GTIN)."""
+    return "-b-" in canonical_sku(sku)
+
+
+class BundleRule:
+    """The bad component keys (key -> the list it came from), the album sets (frozenset -> (bundle, source)
+    of the set file) and a report of what was read."""
+
+    def __init__(self) -> None:
+        self.keys: dict[str, str] = {}
+        self.sets: dict[frozenset, tuple[str, str]] = {}
+        self.report: dict = {}
+
+
+def load_bundle_rule() -> BundleRule:
+    """The rule's inputs (see the module doc). Refuses (RuntimeError, written to the log as REFUSED) a
+    rule it cannot build, unless the dated waiver holds."""
+    return _load_bundle_rule(log_refusal=True)
+
+
+def _rule_table(path: Path) -> tuple[list[str], list[list[str]]]:
+    """A rule input read like a list (_parse_table), and every row as long as the header: a shorter row
+    would lose its key without a word, so it refuses."""
+    header, body = _parse_table(path)
+    for number, row in enumerate(body, start=2):
+        if len(row) < len(header):
+            raise ValueError(f"line {number} has fewer columns than the header")
+    return header, body
+
+
+def _load_bundle_rule(log_refusal: bool) -> BundleRule:
+    directory, layer = _lists_dir()
+    rule, problems, counted = BundleRule(), [], {}
+    for name in (*RETIRED_SKU_FILES, *BUNDLE_HOLD_FILES):
+        path = directory / name
+        try:
+            header, body = _read_list(path, _rule_table)
+        except OSError as exc:
+            problems.append(f"{path}: {exc}")
+            continue
+        flag_at = None
+        if name in BUNDLE_FLAGGED_ONLY:
+            if "policy_flagged" not in header:
+                problems.append(f"{path}: has no policy_flagged column, so its bad rows cannot be told from the others")
+                continue
+            flag_at = header.index("policy_flagged")
+        sku_at = header.index("sku")
+        gtin_at = header.index("gtin") if "gtin" in header else None
+        bad = 0
+        for row in body:
+            if flag_at is not None and row[flag_at].strip().casefold() != "yes":
+                continue
+            bad += 1
+            for key in component_keys(row[sku_at], row[gtin_at] if gtin_at is not None else ""):
+                rule.keys.setdefault(key, name)
+        counted[name] = bad
+    path = directory / BUNDLE_SET_FILE
+    try:
+        header, body = _read_list(path, _rule_table)
+        if "component_gtins" not in header:
+            raise OSError(f"has no component_gtins column (columns: {', '.join(header)})")
+        sku_at, sets_at = header.index("sku"), header.index("component_gtins")
+        source_at = header.index("source") if "source" in header else None
+        for number, row in enumerate(body, start=2):
+            tokens = row[sets_at].split()
+            if not tokens or not all(token.isdigit() and token.isascii() for token in tokens):
+                raise OSError(f"line {number}: component_gtins must be digits separated by spaces ({row[sets_at]!r})")
+            components = frozenset(canonical_gtin(token) for token in tokens)
+            if "" in components:
+                raise OSError(f"line {number}: component_gtins holds an all zero barcode")
+            rule.sets.setdefault(components, (row[sku_at].strip(), row[source_at].strip() if source_at is not None else ""))
+        counted[BUNDLE_SET_FILE] = len(body)
+    except OSError as exc:
+        problems.append(f"{path}: {exc}")
+    rule.report = {"dir": str(directory), "dir_source": layer, "counted": counted, "problems": problems,
+                   "unfiltered": False, "waiver_until": None}
+    if problems:
+        refusal = (f"The bundle component rule cannot be built: {'; '.join(problems)}. A new bundle whose component "
+                   "Walmart flagged would be sent, so nothing was sent. Fix the files (git pull the compliance clone, "
+                   "copy them to the G: mirror, or set WALMART_RETIRED_SKUS_DIR), or waive on purpose with "
+                   "ALLOW_UNFILTERED_EXPORT=1 and ALLOW_UNFILTERED_EXPORT_UNTIL=YYYY-MM-DD.")
+        until, why_not = _waiver_until()
+        if until is None:
+            if _setting("ALLOW_UNFILTERED_EXPORT") == "1":
+                refusal = f"{refusal} The waiver ALLOW_UNFILTERED_EXPORT=1 does not apply: {why_not}."
+            if log_refusal:
+                _log_refusal(refusal)
+            raise RuntimeError(refusal)
+        rule.report.update(unfiltered=True, waiver_until=until.isoformat())
+        print(f"[WARNING] Waiver ALLOW_UNFILTERED_EXPORT=1 holds until {until}; the bundle component rule runs with "
+              f"only the files that loaded ({len(rule.keys)} keys, {len(rule.sets)} album sets).")
+    return rule
+
+
+def _bundle_reason(sku: object, description: object, rule: BundleRule) -> tuple[str, str, str] | None:
+    """(reason, detail, source) of a dropped row, or None when it passes (a row that is not a bundle
+    always passes). Reasons: "components unknown", "bad component", "album set"."""
+    if not is_bundle_sku(sku):
+        return None
+    text = description if isinstance(description, str) else ""
+    barcodes = [canonical_gtin(code) for code in _BARCODE.findall(text)]
+    stated = _STATED_COUNT.search(text)
+    if (not barcodes or "" in barcodes or not stated or int(stated.group(1)) != len(barcodes)
+            or len(_BARCODE_WORD.findall(text)) != len(barcodes) or _BARCODE_RUN_ON.search(text)):
+        return "components unknown", "", ""
+    for code in barcodes:
+        if code in rule.keys:
+            return "bad component", code, rule.keys[code]
+    listed = rule.sets.get(frozenset(barcodes))
+    if listed:
+        return "album set", listed[0], listed[1] or BUNDLE_SET_FILE
+    return None
+
+
+def bundle_verdict(sku: object, description: object, rule: BundleRule) -> str:
+    """Why a row is dropped ("components unknown", "bad component <key> (<list>)", "album set of <bundle>
+    (<source>)"), or "" when it passes."""
+    reason = _bundle_reason(sku, description, rule)
+    if reason is None:
+        return ""
+    kind, detail, source = reason
+    if kind == "components unknown":
+        return kind
+    if kind == "bad component":
+        return f"bad component {detail} ({source})"
+    return f"album set of {detail} ({source})"
+
+
+def drop_bad_bundle_rows(frame, label: str, rule: BundleRule | None = None, sku_column: str = "sku",
+                         description_column: str = "shortDescription"):
+    """Rows of a pandas DataFrame that the bundle component rule lets through, paired by position. A frame
+    without the description column has no known components: every bundle row in it is dropped. Logs its
+    own line: the rows dropped per reason and per source, and at most LOG_DROPPED_SHOWN dropped rows."""
+    if rule is None:
+        rule = load_bundle_rule()
+    skus = frame[sku_column].tolist()
+    descriptions = frame[description_column].tolist() if description_column in frame.columns else [None] * len(skus)
+    reasons = [_bundle_reason(sku, text, rule) for sku, text in zip(skus, descriptions)]
+    mask = [r is None for r in reasons]
+    kept = frame.loc[mask]
+    per_reason = {"bad component": {}, "album set": {}, "components unknown": {}}
+    for reason in reasons:
+        if reason:
+            sources = per_reason[reason[0]]
+            sources[reason[2]] = sources.get(reason[2], 0) + 1
+    totals = {kind: sum(sources.values()) for kind, sources in per_reason.items()}
+    by_source = "; ".join(f"{kind}: " + ", ".join(f"{source} {count}" for source, count in sorted(sources.items()))
+                          for kind, sources in per_reason.items() if sources and kind != "components unknown")
+    checked = sum(1 for sku in skus if is_bundle_sku(sku))
+    counted = ", ".join(f"{name}={count}" for name, count in rule.report.get("counted", {}).items())
+    waived = (f"; UNFILTERED, waiver until {rule.report['waiver_until']}, problems: {'; '.join(rule.report['problems'])}"
+              if rule.report.get("unfiltered") else "")
+    dropped = [f"{str(sku).strip()} ({bundle_verdict(sku, text, rule)})"
+               for sku, text, reason in zip(skus, descriptions, reasons) if reason]
+    shown = ", ".join(dropped[:LOG_DROPPED_SHOWN]) + (f", and {len(dropped) - LOG_DROPPED_SHOWN} more"
+                                                      if len(dropped) > LOG_DROPPED_SHOWN else "")
+    _write_log_line(f"{datetime.datetime.now().isoformat(timespec='seconds')} {label}: kept {len(kept)}, "
+                    f"dropped {mask.count(False)} bundle row(s) by component rule = {totals['bad component']} bad "
+                    f"component, {totals['album set']} album set, {totals['components unknown']} components unknown"
+                    f"{' (' + by_source + ')' if by_source else ''}; rows in {len(skus)}; {checked} bundle row(s) "
+                    f"checked; rule holds {len(rule.keys)} bad component keys and {len(rule.sets)} album sets from "
+                    f"{rule.report.get('dir')} ({counted}){waived}; dropped: {shown}")
+    return kept
+
+
+# --------------------------------------------------------------------------------------------------
 # liveness: python walmart_retired_filter.py --status
 # --------------------------------------------------------------------------------------------------
 
@@ -676,6 +920,10 @@ def status() -> list[str]:
     problems: list[str] = []
     try:
         _load(log_refusal=False)  # a refusal here is the status's finding, not a gate run: never logged
+    except RuntimeError as exc:
+        problems.append(str(exc))
+    try:
+        _load_bundle_rule(log_refusal=False)  # WO-52: the bundle component rule's inputs, judged the same way
     except RuntimeError as exc:
         problems.append(str(exc))
     limit = _number("WALMART_GATE_LOG_MAX_AGE_HOURS", LOG_MAX_AGE_HOURS)
