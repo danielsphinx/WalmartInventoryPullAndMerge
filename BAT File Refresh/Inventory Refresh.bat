@@ -22,6 +22,7 @@ set "logdir=G:\Documents And Logs"
 set "logfile=%logdir%\Bat Walmart Logs.txt"
 set "runlog=%logdir%\Bat Walmart Logs - current run.txt"
 set "lockfile=%logdir%\Bat Walmart Logs.lock"
+set "prevlog=%logdir%\Bat Walmart Logs - previous.txt"
 set "script=G:\Python Projects\WalmartInventoryPullAndMerge\main.py"
 set "PYTHONIOENCODING=utf-8"
 
@@ -53,7 +54,20 @@ if not defined py (
 set "rc=%errorlevel%"
 :finish
 >> "%runlog%" echo Finished at %date% %time% with exit code %rc% on %COMPUTERNAME%
+call :rotate
 type "%runlog%" >> "%logfile%" && del "%runlog%"
+goto :eof
+
+:rotate
+rem Cap the main log: past about 50 MB it becomes "Bat Walmart Logs - previous.txt"
+rem (replacing the one before) and the new log starts with every Finished and
+rem already-running line carried over, so whatever reads the last result per
+rem computer still finds it. Runs inside the lock, just before a run is appended.
+if not exist "%logfile%" goto :eof
+for %%F in ("%logfile%") do if %%~zF LSS 50000000 goto :eof
+move /y "%logfile%" "%prevlog%" >nul 2>&1 || goto :eof
+>> "%logfile%" echo Log rotated at %date% %time% on %COMPUTERNAME% - older output is in "Bat Walmart Logs - previous.txt"; result lines carried over:
+findstr /r /c:"^Finished at " /c:"already running - this call skipped" "%prevlog%" >> "%logfile%"
 goto :eof
 
 :pick_python
